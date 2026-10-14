@@ -141,23 +141,44 @@ app.get('/status', (req, res) => {
   res.json({ status: connectionStatus, phone: connectedPhone, qr: qrCodeBase64 });
 });
 
-// Rota de Disparo de Mensagens (Usada pelos FUPs Automáticos da IA)
+// Rota de Disparo de Mensagens (Com resolução automática do 9º dígito BR)
 app.post('/send', async (req, res) => {
   const token = req.headers['apikey'] || req.headers['authorization']?.replace('Bearer ', '');
   if (token !== API_KEY) {
     return res.status(401).json({ error: 'Não autorizado' });
   }
   if (connectionStatus !== 'connected' || !sock) {
-    return res.status(400).json({ error: 'WhatsApp não está conectado no momento.' });
+    return res.status(400).json({ error: 'WhatsApp não está conectado no momento.', connectionStatus });
   }
 
   try {
     const { phone, message } = req.body;
-    const cleanPhone = String(phone || '').replace(/\D/g, '');
-    const jid = cleanPhone.startsWith('55') ? `${cleanPhone}@s.whatsapp.net` : `55${cleanPhone}@s.whatsapp.net`;
+    let cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone.startsWith('55')) {
+      cleanPhone = `55${cleanPhone}`;
+    }
 
-    await sock.sendMessage(jid, { text: message });
-    return res.json({ status: 'sent', to: jid });
+    // Testa variações com e sem o 9º dígito para encontrar a conta real no WhatsApp
+    const candidates = [cleanPhone];
+    if (cleanPhone.length === 13 && cleanPhone[4] === '9') {
+      // Remove o 9º dígito (Ex: 5564992228607 -> 556492228607)
+      candidates.push(cleanPhone.slice(0, 4) + cleanPhone.slice(5));
+    } else if (cleanPhone.length === 12) {
+      // Adiciona o 9º dígito (Ex: 556492228607 -> 5564992228607)
+      candidates.push(cleanPhone.slice(0, 4) + '9' + cleanPhone.slice(4));
+    }
+
+    let targetJid = `${cleanPhone}@s.whatsapp.net`;
+    for (const num of candidates) {
+      const [result] = await sock.onWhatsApp(num);
+      if (result && result.exists) {
+        targetJid = result.jid;
+        break;
+      }
+    }
+
+    const sentMsg = await sock.sendMessage(targetJid, { text: message });
+    return res.json({ status: 'sent', to: targetJid, messageId: sentMsg?.key?.id });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
