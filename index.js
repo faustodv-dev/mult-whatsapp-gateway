@@ -1,8 +1,9 @@
 import makeWASocket, {
-   useMultiFileAuthState,
+  useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  Browsers
+  Browsers,
+  makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
@@ -25,7 +26,8 @@ const SUPABASE_KEY = (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_R
 const sessions = {};
 const sendQueues = {};
 const sentMessagesCache = new Map();
-const lidToPhoneMap = new Map(); // Tradutor automático de @lid para número real
+const processedMsgIds = new Set(); // Evita duplicidade entre upsert e update
+const lidToPhoneMap = new Map();
 let cachedUnits = [];
 const recentEvents = [];
 
@@ -35,7 +37,7 @@ const randomBetween = (min, max) => Math.floor(Math.random() * (max - min + 1)) 
 
 function logEvent(info) {
   recentEvents.unshift({ time: new Date().toISOString(), ...info });
-  if (recentEvents.length > 20) recentEvents.pop();
+  if (recentEvents.length > 25) recentEvents.pop();
 }
 
 function extractMessageText(messageObj) {
@@ -45,6 +47,7 @@ function extractMessageText(messageObj) {
     messageObj.viewOnceMessage?.message ||
     messageObj.viewOnceMessageV2?.message ||
     messageObj.documentWithCaptionMessage?.message ||
+    messageObj.editedMessage?.message?.protocolMessage?.editedMessage ||
     messageObj;
 
   return (
@@ -91,8 +94,88 @@ async function updateUnitInSupabase(unitId, status, phone = null) {
   } catch {}
 }
 
+// Processador unificado de mensagem (usado tanto no 1º recebimento quanto após o Retry de descriptografia)
+async function processIncomingMessage(unitId, unitName, key, messageObj, pushName) {
+  const remoteJid = key?.remoteJid || '';
+  if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) {
+    return;
+  }
+
+  const msgId = key?.id;
+  if (msgId && processedMsgIds.has(msgId)) return;
+
+  if (!messageObj) {
+    logEvent({ status: 'decrypt_retry_requested', remoteJid, key });
+    return;
+  }
+
+  // Ignora mensagens internas de protocolo (sincronização de chaves/histórico)
+  if (messageObj.protocolMessage || messageObj.senderKeyDistributionMessage || messageObj.reactionMessage) {
+    return;
+  }
+
+  // Resolve o telefone real mesmo em conexões @lid
+  if (key.senderPn && remoteJid.includes('@lid')) {
+    lidToPhoneMap.set(remoteJid, key.senderPn);
+  }
+  const mappedJid = lidToPhoneMap.get(remoteJid) || '';
+  const rawPhone =
+    key.senderPn ||
+    key.participantPn ||
+    key.remoteJidAlt ||
+    mappedJid ||
+    remoteJid;
+
+  const phone = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
+  const fromMe = Boolean(key.fromMe);
+  const senderName = pushName || 'Lead WhatsApp';
+  const text = extractMessageText(messageObj);
+
+  if (!phone || !text) {
+    logEvent({ status: 'ignored_non_text', remoteJid, phone, keys: Object.keys(messageObj || {}) });
+    return;
+  }
+
+  if (msgId) {
+    processedMsgIds.add(msgId);
+    if (processedMsgIds.size > 500) {
+      const first = processedMsgIds.values().next().value;
+      processedMsgIds.delete(first);
+    }
+  }
+
+  try {
+    const whRes = await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        unitId,
+        unitName,
+        phone,
+        remoteJid,
+        senderName,
+        message: text,
+        fromMe
+      })
+    });
+    const whBody = await whRes.text();
+    logEvent({
+      status: 'delivered_to_crm',
+      unitName,
+      phone,
+      remoteJid,
+      text,
+      fromMe,
+      httpStatus: whRes.status,
+      crmResponse: whBody.slice(0, 180)
+    });
+  } catch (err) {
+    logEvent({ status: 'webhook_error', error: err.message });
+  }
+}
+
 // ============================================================================
-// MOTOR OFICIAL BAILEYS (useMultiFileAuthState = Criptografia Signal 100% Nativa)
+// MOTOR OFICIAL BAILEYS COM CACHE SIGNAL E SUPORTE A RETRY (@lid + Multi-Device)
 // ============================================================================
 async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
   if (!unitId) return;
@@ -120,13 +203,17 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
 
     const sock = makeWASocket({
       version,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        // Essencial para evitar perda de PreKeys/Session em mensagens @lid
+        keys: makeCacheableSignalKeyStore(state.keys, logger)
+      },
       printQRInTerminal: false,
       logger,
-      browser: Browsers.macOS('Desktop'),
-      syncFullHistory: false,
+      browser: Browsers.ubuntu('Chrome'),
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
+      msgRetryCounterCache: undefined,
       getMessage: async (key) => {
         const cachedText = sentMessagesCache.get(key.id);
         if (cachedText) return { conversation: cachedText };
@@ -137,12 +224,9 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     session.sock = sock;
     sock.ev.on('creds.update', saveCreds);
 
-    // Captura mapeamento de contatos (@lid -> número real)
     sock.ev.on('contacts.upsert', (contacts) => {
       for (const c of contacts) {
-        if (c.lid && c.id) {
-          lidToPhoneMap.set(c.lid, c.id);
-        }
+        if (c.lid && c.id) lidToPhoneMap.set(c.lid, c.id);
       }
     });
 
@@ -177,66 +261,19 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       }
     });
 
+    // 1. Captura mensagens que abrem na 1ª tentativa
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify' && m.type !== 'append') return;
-
       for (const msg of m.messages) {
-        const remoteJid = msg.key?.remoteJid || '';
-        if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) {
-          continue;
-        }
+        await processIncomingMessage(unitId, unitName, msg.key, msg.message, msg.pushName);
+      }
+    });
 
-        if (!msg.message) {
-          logEvent({ status: 'decrypt_retry_or_empty', remoteJid, key: msg.key });
-          continue;
-        }
-
-        // Resolve o telefone real mesmo quando vem como @lid
-        const mappedJid = lidToPhoneMap.get(remoteJid) || '';
-        const rawPhone =
-          msg.key.senderPn ||
-          msg.key.participantPn ||
-          msg.key.remoteJidAlt ||
-          mappedJid ||
-          remoteJid;
-
-        const phone = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
-        const fromMe = Boolean(msg.key.fromMe);
-        const senderName = msg.pushName || 'Lead WhatsApp';
-        const text = extractMessageText(msg.message);
-
-        if (!phone || !text) {
-          logEvent({ status: 'ignored_non_text', remoteJid, phone, keys: Object.keys(msg.message || {}) });
-          continue;
-        }
-
-        try {
-          const whRes = await fetch(WEBHOOK_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              unitId,
-              unitName,
-              phone,
-              remoteJid, // Envia também o JID exato caso seja @lid
-              senderName,
-              message: text,
-              fromMe
-            })
-          });
-          const whBody = await whRes.text();
-          logEvent({
-            status: 'delivered_to_crm',
-            unitName,
-            phone,
-            remoteJid,
-            text,
-            fromMe,
-            httpStatus: whRes.status,
-            crmResponse: whBody.slice(0, 180)
-          });
-        } catch (err) {
-          logEvent({ status: 'webhook_error', error: err.message });
+    // 2. Captura mensagens que abriram na 2ª tentativa (após Retry de criptografia @lid!)
+    sock.ev.on('messages.update', async (updates) => {
+      for (const u of updates) {
+        if (u.update?.message) {
+          await processIncomingMessage(unitId, unitName, u.key, u.update.message, u.update.pushName || 'Lead WhatsApp');
         }
       }
     });
@@ -332,7 +369,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial Nativo + Keep-Alive 24/7 + Simulação Humana Anti-Ban:</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v4 (Signal KeyStore + Captura Retry @lid):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -411,7 +448,7 @@ app.get('/status', (req, res) => {
     summary[id] = { name: s.name, status: s.status, phone: s.phone };
   }
   res.json({
-    engine: 'native_multifile_v3',
+    engine: 'native_multifile_v4_signal_cache',
     active_sessions: Object.keys(sessions).length,
     webhook_url_configured: WEBHOOK_URL,
     units: summary,
@@ -476,6 +513,6 @@ app.post('/send', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor Multi-Unidades Nativo MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v4 MULT CRM rodando na porta ${PORT}`);
   restoreLocalSessions();
 });
