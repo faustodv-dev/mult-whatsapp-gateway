@@ -1,15 +1,14 @@
 import makeWASocket, {
+   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  initAuthCreds,
-  BufferJSON,
-  Browsers,
-  makeCacheableSignalKeyStore
+  Browsers
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
 import QRCode from 'qrcode';
 import pino from 'pino';
+import fs from 'fs';
 
 const app = express();
 app.use(cors());
@@ -26,6 +25,7 @@ const SUPABASE_KEY = (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_R
 const sessions = {};
 const sendQueues = {};
 const sentMessagesCache = new Map();
+const lidToPhoneMap = new Map(); // Tradutor automático de @lid para número real
 let cachedUnits = [];
 const recentEvents = [];
 
@@ -48,150 +48,15 @@ function extractMessageText(messageObj) {
     messageObj;
 
   return (
-    m?.conversation ||
-    m?.extendedTextMessage?.text ||
-    m?.imageMessage?.caption ||
-    m?.videoMessage?.caption ||
-    m?.buttonsResponseMessage?.selectedDisplayText ||
-    m?.listResponseMessage?.title ||
-    m?.templateButtonReplyMessage?.selectedDisplayText ||
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
     ''
   );
-}
-
-async function useSupabaseAuthState(unitId) {
-  const memoryStore = new Map();
-  const dirtyKeys = new Set();
-  const deletedKeys = new Set();
-
-  if (SUPABASE_KEY) {
-    try {
-      const res = await fetch(
-        `${SUPABASE_URL}/rest/v1/whatsapp_sessions?unit_id=eq.${encodeURIComponent(String(unitId))}&select=id,data`,
-        { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-      );
-      if (res.ok) {
-        const rows = await res.json();
-        for (const row of rows || []) {
-          const shortKey = String(row.id).replace(`${unitId}__`, '');
-          const revived = JSON.parse(JSON.stringify(row.data), BufferJSON.reviver);
-          memoryStore.set(shortKey, revived);
-        }
-      }
-    } catch (e) {
-      console.error('Erro ao carregar cofre:', e.message);
-    }
-  }
-
-  let isFlushing = false;
-  const flushToSupabase = async () => {
-    if (!SUPABASE_KEY || isFlushing || (dirtyKeys.size === 0 && deletedKeys.size === 0)) return;
-    isFlushing = true;
-    try {
-      if (dirtyKeys.size > 0) {
-        const keysToSave = Array.from(dirtyKeys);
-        dirtyKeys.clear();
-        const payload = keysToSave
-          .filter((k) => memoryStore.has(k))
-          .map((k) => ({
-            id: `${unitId}__${k}`,
-            unit_id: String(unitId),
-            data: JSON.parse(JSON.stringify(memoryStore.get(k), BufferJSON.replacer)),
-            updated_at: new Date().toISOString()
-          }));
-
-        if (payload.length > 0) {
-          await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions`, {
-            method: 'POST',
-            headers: {
-              apikey: SUPABASE_KEY,
-              Authorization: `Bearer ${SUPABASE_KEY}`,
-              'Content-Type': 'application/json',
-              Prefer: 'resolution=merge-duplicates'
-            },
-            body: JSON.stringify(payload)
-          });
-        }
-      }
-
-      if (deletedKeys.size > 0) {
-        const keysToDel = Array.from(deletedKeys);
-        deletedKeys.clear();
-        for (const k of keysToDel) {
-          const id = `${unitId}__${k}`;
-          await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions?id=eq.${encodeURIComponent(id)}`, {
-            method: 'DELETE',
-            headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
-          });
-        }
-      }
-    } catch (e) {
-      console.error('Erro flush Supabase:', e.message);
-    } finally {
-      isFlushing = false;
-    }
-  };
-
-  const flushTimer = setInterval(flushToSupabase, 4000);
-  const creds = memoryStore.get('creds') || initAuthCreds();
-  memoryStore.set('creds', creds);
-
-  const rawKeys = {
-    get: async (type, ids) => {
-      const data = {};
-      for (const id of ids) {
-        const val = memoryStore.get(`${type}-${id}`);
-        data[id] = val || null;
-      }
-      return data;
-    },
-    set: async (data) => {
-      for (const category in data) {
-        for (const id in data[category]) {
-          const value = data[category][id];
-          const key = `${category}-${id}`;
-          if (value) {
-            memoryStore.set(key, value);
-            dirtyKeys.add(key);
-            deletedKeys.delete(key);
-          } else {
-            memoryStore.delete(key);
-            dirtyKeys.delete(key);
-            deletedKeys.add(key);
-          }
-        }
-      }
-      flushToSupabase();
-    }
-  };
-
-  return {
-    state: {
-      creds,
-      keys: makeCacheableSignalKeyStore(rawKeys, logger)
-    },
-    saveCreds: async () => {
-      memoryStore.set('creds', creds);
-      dirtyKeys.add('creds');
-      await flushToSupabase();
-    },
-    clearSession: async () => {
-      clearInterval(flushTimer);
-      memoryStore.clear();
-      dirtyKeys.clear();
-      deletedKeys.clear();
-      if (!SUPABASE_KEY) return;
-      try {
-        await fetch(
-          `${SUPABASE_URL}/rest/v1/whatsapp_sessions?unit_id=eq.${encodeURIComponent(String(unitId))}`,
-          {
-            method: 'DELETE',
-            headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
-          }
-        );
-      } catch {}
-    }
-  };
 }
 
 async function fetchUnitsFromSupabase() {
@@ -206,7 +71,7 @@ async function fetchUnitsFromSupabase() {
       if (Array.isArray(data)) cachedUnits = data;
     }
   } catch (err) {
-    console.error('Erro ao buscar unidades:', err.message);
+    console.error('Erro ao buscar unidades no Supabase:', err.message);
   }
   return cachedUnits;
 }
@@ -226,6 +91,9 @@ async function updateUnitInSupabase(unitId, status, phone = null) {
   } catch {}
 }
 
+// ============================================================================
+// MOTOR OFICIAL BAILEYS (useMultiFileAuthState = Criptografia Signal 100% Nativa)
+// ============================================================================
 async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
   if (!unitId) return;
 
@@ -233,20 +101,21 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     return sessions[unitId];
   }
 
+  const authFolder = `./auth_info_${unitId}`;
+
   sessions[unitId] = {
     sock: null,
     qrCodeBase64: null,
     status: 'starting',
     phone: null,
     name: unitName,
-    clearSession: null
+    authFolder
   };
 
   const session = sessions[unitId];
 
   try {
-    const { state, saveCreds, clearSession } = await useSupabaseAuthState(unitId);
-    session.clearSession = clearSession;
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -261,12 +130,21 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       getMessage: async (key) => {
         const cachedText = sentMessagesCache.get(key.id);
         if (cachedText) return { conversation: cachedText };
-        return { conversation: 'Olá!' };
+        return undefined;
       }
     });
 
     session.sock = sock;
     sock.ev.on('creds.update', saveCreds);
+
+    // Captura mapeamento de contatos (@lid -> número real)
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const c of contacts) {
+        if (c.lid && c.id) {
+          lidToPhoneMap.set(c.lid, c.id);
+        }
+      }
+    });
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -285,10 +163,10 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         await updateUnitInSupabase(unitId, 'disconnected', null);
 
         if (loggedOut) {
-          await clearSession();
+          try { fs.rmSync(authFolder, { recursive: true, force: true }); } catch {}
           delete sessions[unitId];
         } else {
-          const retryMs = randomBetween(5000, 10000);
+          const retryMs = randomBetween(4000, 8000);
           setTimeout(() => startUnitWhatsApp(unitId, unitName), retryMs);
         }
       } else if (connection === 'open') {
@@ -299,29 +177,38 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       }
     });
 
-    // CAPTURA UNIVERSAL DE MENSAGENS (Sem ignorar notify/append)
     sock.ev.on('messages.upsert', async (m) => {
-      for (const msg of m.messages) {
-        const remoteJid = msg.key.remoteJid || '';
-        if (remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) continue;
+      if (m.type !== 'notify' && m.type !== 'append') return;
 
-        const text = extractMessageText(msg.message);
-        if (!text) {
-          logEvent({ status: 'ignored_empty_text', remoteJid, type: m.type });
+      for (const msg of m.messages) {
+        const remoteJid = msg.key?.remoteJid || '';
+        if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) {
           continue;
         }
 
+        if (!msg.message) {
+          logEvent({ status: 'decrypt_retry_or_empty', remoteJid, key: msg.key });
+          continue;
+        }
+
+        // Resolve o telefone real mesmo quando vem como @lid
+        const mappedJid = lidToPhoneMap.get(remoteJid) || '';
         const rawPhone =
           msg.key.senderPn ||
           msg.key.participantPn ||
           msg.key.remoteJidAlt ||
-          (remoteJid.includes('@lid') ? '' : remoteJid);
-        const phone = String(rawPhone || remoteJid).split('@')[0].split(':')[0].replace(/\D/g, '');
+          mappedJid ||
+          remoteJid;
 
+        const phone = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
         const fromMe = Boolean(msg.key.fromMe);
         const senderName = msg.pushName || 'Lead WhatsApp';
+        const text = extractMessageText(msg.message);
 
-        if (!phone) continue;
+        if (!phone || !text) {
+          logEvent({ status: 'ignored_non_text', remoteJid, phone, keys: Object.keys(msg.message || {}) });
+          continue;
+        }
 
         try {
           const whRes = await fetch(WEBHOOK_URL, {
@@ -331,6 +218,7 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
               unitId,
               unitName,
               phone,
+              remoteJid, // Envia também o JID exato caso seja @lid
               senderName,
               message: text,
               fromMe
@@ -338,9 +226,10 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
           });
           const whBody = await whRes.text();
           logEvent({
-            status: 'delivered_to_crm_success',
+            status: 'delivered_to_crm',
             unitName,
             phone,
+            remoteJid,
             text,
             fromMe,
             httpStatus: whRes.status,
@@ -356,51 +245,39 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
   }
 }
 
-async function restoreSavedSessionsFromSupabase() {
-  if (!SUPABASE_KEY) return;
-  try {
-    const units = await fetchUnitsFromSupabase();
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions?select=unit_id`, {
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
-    });
-    if (!res.ok) return;
-    const rows = await res.json();
-    const savedUnitIds = [...new Set((rows || []).map((r) => String(r.unit_id)))];
-
-    for (const unitId of savedUnitIds) {
-      const unit = units.find((u) => String(u.id) === unitId);
-      if (unit) {
-        startUnitWhatsApp(unit.id, unit.name);
-        await sleep(2000);
-      }
+async function restoreLocalSessions() {
+  const units = await fetchUnitsFromSupabase();
+  for (const unit of units) {
+    const folder = `./auth_info_${unit.id}`;
+    if (fs.existsSync(folder)) {
+      startUnitWhatsApp(unit.id, unit.name);
+      await sleep(1500);
     }
-  } catch (err) {
-    console.error('Erro restore:', err.message);
   }
 }
 
 async function sendHumanizedMessage(unitId, targetJid, messageText) {
   const session = sessions[unitId];
   if (!session || session.status !== 'connected' || !session.sock) {
-    throw new Error('Sessão desconectada.');
+    throw new Error('Sessão da unidade desconectada.');
   }
   const sock = session.sock;
 
-  await sleep(randomBetween(1200, 2500));
+  await sleep(randomBetween(1000, 2200));
 
   try {
     await sock.presenceSubscribe(targetJid);
     await sock.sendPresenceUpdate('composing', targetJid);
   } catch {}
 
-  const typingTimeMs = Math.min(Math.max(messageText.length * 35, 3000), 6500) + randomBetween(300, 1000);
+  const typingTimeMs = Math.min(Math.max(messageText.length * 32, 2800), 6000) + randomBetween(200, 800);
   await sleep(typingTimeMs);
 
   try {
     await sock.sendPresenceUpdate('paused', targetJid);
   } catch {}
 
-  await sleep(randomBetween(300, 700));
+  await sleep(randomBetween(300, 600));
 
   const sentMsg = await sock.sendMessage(targetJid, { text: messageText });
 
@@ -425,7 +302,7 @@ function enqueueUnitSend(unitId, taskFn) {
   }
   const nextTask = sendQueues[unitId].then(async () => {
     const result = await taskFn();
-    await sleep(randomBetween(4000, 8000));
+    await sleep(randomBetween(3500, 7000));
     return result;
   });
   sendQueues[unitId] = nextTask.catch(() => {});
@@ -443,7 +320,7 @@ app.get('/', async (req, res) => {
       <div style="background:#1e293b;padding:24px;border-radius:12px;width:290px;border:1px solid ${isConn ? '#22c55e' : '#334155'};">
         <h2 style="margin:0 0 10px 0;color:#f8fafc;font-size:20px;">📍 ${u.name}</h2>
         <p style="color:${isConn ? '#22c55e' : '#94a3b8'};font-weight:bold;min-height:24px;">
-          ${isConn ? `✅ Blindado (\${s.phone})` : '⚪ Desconectado'}
+          ${isConn ? `✅ Conectado (\${s.phone})` : '⚪ Desconectado'}
         </p>
         <a href="/connect/${u.id}" style="display:inline-block;margin-top:12px;padding:10px 20px;background:${isConn ? '#334155' : '#f97316'};color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;">
           ${isConn ? 'Ver Status / Desconectar' : '📱 Gerar QR Code'}
@@ -454,9 +331,10 @@ app.get('/', async (req, res) => {
 
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
-      <h1 style="color:#f97316;">🛡️ Central WhatsApp Blindada - MULT Profissões</h1>
-      <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:30px auto;">
-        ${cardsHtml}
+      <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial Nativo + Keep-Alive 24/7 + Simulação Humana Anti-Ban:</p>
+      <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
+        ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
     </div>
   `);
@@ -478,11 +356,13 @@ app.get('/connect/:unitId', async (req, res) => {
   if (s.status === 'connected') {
     return res.send(`
       <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
-        <a href="/" style="color:#94a3b8;text-decoration:none;">← Voltar</a>
+        <a href="/" style="color:#94a3b8;text-decoration:none;">← Voltar para Todas as Unidades</a>
         <h1 style="color:#22c55e;margin-top:25px;">✅ WhatsApp ${unit.name} Conectado!</h1>
-        <p>Aparelho: <strong>${s.phone}</strong></p>
+        <p style="font-size:18px;">Aparelho ativo: <strong>${s.phone}</strong></p>
         <form method="POST" action="/logout/${unit.id}" style="margin-top:30px;">
-          <button type="submit" style="padding:10px 20px;background:#ef4444;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold;">🔌 Desconectar</button>
+          <button type="submit" style="padding:10px 20px;background:#ef4444;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold;">
+            🔌 Desconectar e Limpar Sessão
+          </button>
         </form>
       </div>
     `);
@@ -491,11 +371,13 @@ app.get('/connect/:unitId', async (req, res) => {
   if (s.status === 'qr_ready' && s.qrCodeBase64) {
     return res.send(`
       <div style="font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#fff;min-height:100vh;">
-        <a href="/" style="color:#94a3b8;text-decoration:none;">← Voltar</a>
-        <h1 style="color:#f97316;">📱 Conectar: ${unit.name}</h1>
+        <a href="/" style="color:#94a3b8;text-decoration:none;">← Voltar para Todas as Unidades</a>
+        <h1 style="color:#f97316;margin-top:20px;">📱 Conectar Unidade: ${unit.name}</h1>
+        <p>Abra o WhatsApp da unidade <strong>${unit.name}</strong> > Aparelhos Conectados > Conectar um aparelho:</p>
         <div style="background:#fff;padding:20px;display:inline-block;border-radius:16px;margin-top:15px;">
           <img src="${s.qrCodeBase64}" style="width:280px;height:280px;" />
         </div>
+        <p style="color:#94a3b8;margin-top:20px;">A página atualiza sozinha a cada 8 segundos.</p>
         <script>setTimeout(() => location.reload(), 8000);</script>
       </div>
     `);
@@ -512,8 +394,12 @@ app.get('/connect/:unitId', async (req, res) => {
 app.post('/logout/:unitId', async (req, res) => {
   const unitId = req.params.unitId;
   const s = sessions[unitId];
-  if (s?.sock) { try { await s.sock.logout(); } catch {} }
-  if (s?.clearSession) { await s.clearSession(); }
+  if (s?.sock) {
+    try { await s.sock.logout(); } catch {}
+  }
+  if (s?.authFolder) {
+    try { fs.rmSync(s.authFolder, { recursive: true, force: true }); } catch {}
+  }
   delete sessions[unitId];
   await updateUnitInSupabase(unitId, 'disconnected', null);
   res.redirect('/');
@@ -525,9 +411,11 @@ app.get('/status', (req, res) => {
     summary[id] = { name: s.name, status: s.status, phone: s.phone };
   }
   res.json({
+    engine: 'native_multifile_v3',
     active_sessions: Object.keys(sessions).length,
+    webhook_url_configured: WEBHOOK_URL,
     units: summary,
-    last_events: recentEvents
+    last_webhook_events: recentEvents
   });
 });
 
@@ -537,22 +425,39 @@ app.post('/send', async (req, res) => {
 
   try {
     const { phone, message, unitId } = req.body;
+
     let targetUnitId = unitId && sessions[unitId]?.status === 'connected' ? unitId : null;
     if (!targetUnitId) {
       targetUnitId = Object.keys(sessions).find((k) => sessions[k]?.status === 'connected');
     }
 
     if (!targetUnitId || !sessions[targetUnitId]?.sock) {
-      return res.status(400).json({ error: 'O WhatsApp desta unidade não está conectado.', unitId });
+      return res.status(400).json({ error: 'O WhatsApp desta unidade não está conectado no momento.', unitId });
     }
 
     const sock = sessions[targetUnitId].sock;
     let cleanPhone = String(phone || '').replace(/\D/g, '');
-    if (!cleanPhone.startsWith('55')) cleanPhone = `55${cleanPhone}`;
+    if (!cleanPhone.startsWith('55') && cleanPhone.length <= 11) {
+      cleanPhone = `55${cleanPhone}`;
+    }
+
+    const candidates = [cleanPhone];
+    if (cleanPhone.length === 13 && cleanPhone[4] === '9') {
+      candidates.push(cleanPhone.slice(0, 4) + cleanPhone.slice(5));
+    } else if (cleanPhone.length === 12 && cleanPhone.startsWith('55')) {
+      candidates.push(cleanPhone.slice(0, 4) + '9' + cleanPhone.slice(4));
+    }
 
     let targetJid = `${cleanPhone}@s.whatsapp.net`;
-    const [result] = await sock.onWhatsApp(cleanPhone);
-    if (result && result.exists) targetJid = result.jid;
+    for (const num of candidates) {
+      try {
+        const [result] = await sock.onWhatsApp(num);
+        if (result && result.exists) {
+          targetJid = result.jid;
+          break;
+        }
+      } catch {}
+    }
 
     const sentMsg = await enqueueUnitSend(targetUnitId, () =>
       sendHumanizedMessage(targetUnitId, targetJid, message)
@@ -561,6 +466,7 @@ app.post('/send', async (req, res) => {
     return res.json({
       status: 'sent_humanized',
       unitIdUsed: targetUnitId,
+      unitName: sessions[targetUnitId].name,
       to: targetJid,
       messageId: sentMsg?.key?.id
     });
@@ -570,6 +476,6 @@ app.post('/send', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Gateway rodando na porta ${PORT}`);
-  restoreSavedSessionsFromSupabase();
+  console.log(`Servidor Multi-Unidades Nativo MULT CRM rodando na porta ${PORT}`);
+  restoreLocalSessions();
 });
