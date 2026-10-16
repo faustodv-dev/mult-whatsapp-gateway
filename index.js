@@ -14,7 +14,7 @@ import path from 'path';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = (process.env.API_KEY || 'multZap2026!secret').trim();
@@ -26,12 +26,14 @@ const SUPABASE_KEY = (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_R
 
 const sessions = {};
 const sendQueues = {};
-const queueCounts = {};
+const backupTimers = {};
+
 const sentMessagesCache = new Map();
 const recentAiTexts = new Set();
 const processedMsgIds = new Set();
 const lidToPhoneMap = new Map();
 const msgRetryCounterMap = new Map();
+
 let cachedUnits = [];
 const recentEvents = [];
 
@@ -39,31 +41,38 @@ const logger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const randomBetween = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
-// Cache de contador de Retry em memória com limite anti-vazamento
 const msgRetryCounterCache = {
   get: (key) => msgRetryCounterMap.get(key),
-  set: (key, val) => {
-    msgRetryCounterMap.set(key, val);
+  set: (key, value) => {
+    msgRetryCounterMap.set(key, value);
     if (msgRetryCounterMap.size > 1000) {
-      const first = msgRetryCounterMap.keys().next().value;
-      msgRetryCounterMap.delete(first);
+      const firstKey = msgRetryCounterMap.keys().next().value;
+      msgRetryCounterMap.delete(firstKey);
     }
   },
   del: (key) => msgRetryCounterMap.delete(key),
   flushAll: () => msgRetryCounterMap.clear()
 };
 
-function setBoundedMap(map, key, val, max = 1000) {
-  map.set(key, val);
-  if (map.size > max) {
-    const first = map.keys().next().value;
-    map.delete(first);
+function setBoundedMap(map, key, value, maxSize = 1000) {
+  map.set(key, value);
+  if (map.size > maxSize) {
+    const firstKey = map.keys().next().value;
+    map.delete(firstKey);
+  }
+}
+
+function addBoundedSet(set, value, maxSize = 1000) {
+  set.add(value);
+  if (set.size > maxSize) {
+    const firstVal = set.values().next().value;
+    set.delete(firstVal);
   }
 }
 
 function logEvent(info) {
   recentEvents.unshift({ time: new Date().toISOString(), ...info });
-  if (recentEvents.length > 25) recentEvents.pop();
+  if (recentEvents.length > 30) recentEvents.pop();
 }
 
 function extractMessageText(messageObj) {
@@ -88,48 +97,48 @@ function extractMessageText(messageObj) {
   );
 }
 
-// ============================================================================
-// SNAPSHOT DE DISCO <-> SUPABASE (Evita Amnésia do Render SEM tocar no Signal)
-// ============================================================================
-async function syncFolderToSupabase(unitId, authFolder) {
-  if (!SUPABASE_KEY || !fs.existsSync(authFolder)) return;
-  try {
-    const files = fs.readdirSync(authFolder);
-    if (!files.includes('creds.json')) return;
+async function scheduleFolderBackupToSupabase(unitId, authFolder) {
+  if (!SUPABASE_KEY || !unitId) return;
+  if (backupTimers[unitId]) clearTimeout(backupTimers[unitId]);
 
-    const snapshot = {};
-    for (const file of files) {
-      // Salva creds.json, app-state e sessões ativas (mantendo o pacote enxuto e rápido)
-      if (file === 'creds.json' || file.startsWith('session-') || file.startsWith('app-state-sync-key-')) {
+  backupTimers[unitId] = setTimeout(async () => {
+    try {
+      if (!fs.existsSync(authFolder)) return;
+      const files = fs.readdirSync(authFolder);
+      const snapshot = {};
+      for (const file of files) {
         const fullPath = path.join(authFolder, file);
         if (fs.statSync(fullPath).isFile()) {
           snapshot[file] = fs.readFileSync(fullPath, 'utf-8');
         }
       }
-    }
+      if (Object.keys(snapshot).length === 0) return;
 
-    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions`, {
-      method: 'POST',
-      headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'resolution=merge-duplicates'
-      },
-      body: JSON.stringify({
-        id: `snapshot__${unitId}`,
-        unit_id: String(unitId),
-        data: { files: snapshot },
-        updated_at: new Date().toISOString()
-      })
-    });
-  } catch (e) {
-    console.error(`[${unitId}] Erro no snapshot backup:`, e.message);
-  }
+      await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates'
+        },
+        body: JSON.stringify([
+          {
+            id: `snapshot__${unitId}`,
+            unit_id: String(unitId),
+            data: snapshot,
+            updated_at: new Date().toISOString()
+          }
+        ])
+      });
+    } catch (err) {
+      console.error(`[${unitId}] Erro no backup snapshot:`, err.message);
+    }
+  }, 5000);
 }
 
 async function restoreFolderFromSupabase(unitId, authFolder) {
-  if (!SUPABASE_KEY) return false;
+  if (!SUPABASE_KEY || !unitId) return false;
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/whatsapp_sessions?id=eq.${encodeURIComponent(`snapshot__\${unitId}`)}&select=data`,
@@ -137,22 +146,24 @@ async function restoreFolderFromSupabase(unitId, authFolder) {
     );
     if (!res.ok) return false;
     const rows = await res.json();
-    const filesObj = rows?.[0]?.data?.files;
-    if (!filesObj || !filesObj['creds.json']) return false;
+    const snapshot = rows?.[0]?.data;
+    if (!snapshot || typeof snapshot !== 'object' || !snapshot['creds.json']) return false;
 
     fs.mkdirSync(authFolder, { recursive: true });
-    for (const [fileName, content] of Object.entries(filesObj)) {
-      fs.writeFileSync(path.join(authFolder, fileName), String(content), 'utf-8');
+    for (const [fileName, content] of Object.entries(snapshot)) {
+      if (typeof content === 'string') {
+        fs.writeFileSync(path.join(authFolder, fileName), content, 'utf-8');
+      }
     }
     return true;
-  } catch (e) {
-    console.error(`[${unitId}] Erro ao restaurar snapshot:`, e.message);
+  } catch (err) {
+    console.error(`[${unitId}] Erro ao restaurar snapshot:`, err.message);
     return false;
   }
 }
 
 async function deleteSnapshotFromSupabase(unitId) {
-  if (!SUPABASE_KEY) return;
+  if (!SUPABASE_KEY || !unitId) return;
   try {
     await fetch(
       `${SUPABASE_URL}/rest/v1/whatsapp_sessions?unit_id=eq.${encodeURIComponent(String(unitId))}`,
@@ -196,13 +207,8 @@ async function updateUnitInSupabase(unitId, status, phone = null) {
   } catch {}
 }
 
-// ============================================================================
-// PROCESSAMENTO DE MENSAGENS E TRAVA ANTI-ECO NA ORIGEM
-// ============================================================================
 async function processIncomingMessage(unitId, unitName, key, messageObj, pushName) {
   const remoteJid = key?.remoteJid || '';
- // Descarta em silêncio pacotes internos vazios do próprio aparelho (evita poluir a Caixa-Preta)
-  if (!messageObj && key?.fromMe) return;
   if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) {
     return;
   }
@@ -210,19 +216,17 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   const msgId = key?.id;
   if (msgId && processedMsgIds.has(msgId)) return;
 
-  // TRAVA 1 ANTI-ECO: Ignora mensagens cujo ID foi gerado pela própria rota /send
+  if (!messageObj && key?.fromMe) return;
+
   if (msgId && sentMessagesCache.has(msgId)) {
-    setBoundedMap(processedMsgIds, msgId, true, 1000);
+    addBoundedSet(processedMsgIds, msgId);
     logEvent({ status: 'ignored_ai_outbound_echo_by_id', msgId });
     return;
   }
 
-  const fromMe = Boolean(key.fromMe);
-
   if (!messageObj) {
-    // Só registra na Caixa-Preta se for mensagem real de cliente (fromMe: false), evitando poluição de sync!
-    if (!fromMe) {
-      logEvent({ status: 'decrypt_retry_requested', remoteJid, key });
+    if (!key?.fromMe) {
+      logEvent({ status: 'decrypt_retry_requested_lead', remoteJid, key });
     }
     return;
   }
@@ -232,7 +236,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   }
 
   if (key.senderPn && remoteJid.includes('@lid')) {
-    setBoundedMap(lidToPhoneMap, remoteJid, key.senderPn, 1000);
+    setBoundedMap(lidToPhoneMap, remoteJid, key.senderPn);
   }
   const mappedJid = lidToPhoneMap.get(remoteJid) || '';
   const rawPhone =
@@ -243,6 +247,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
     remoteJid;
 
   const phone = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
+  const fromMe = Boolean(key.fromMe);
   const senderName = pushName || 'Lead WhatsApp';
   const text = extractMessageText(messageObj);
 
@@ -253,16 +258,14 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
     return;
   }
 
-  // TRAVA 2 ANTI-ECO: Se for fromMe=true e o texto acabou de sair pela IA, ignora na hora!
-  if (fromMe && recentAiTexts.has(text.trim().slice(0, 50))) {
-    if (msgId) setBoundedMap(processedMsgIds, msgId, true, 1000);
+  const textSignature = text.trim().slice(0, 50);
+  if (fromMe && recentAiTexts.has(textSignature)) {
+    if (msgId) addBoundedSet(processedMsgIds, msgId);
     logEvent({ status: 'ignored_ai_outbound_echo_by_text', phone });
     return;
   }
 
-  if (msgId) {
-    setBoundedMap(processedMsgIds, msgId, true, 1000);
-  }
+  if (msgId) addBoundedSet(processedMsgIds, msgId);
 
   try {
     const whRes = await fetch(WEBHOOK_URL, {
@@ -287,16 +290,13 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
       text,
       fromMe,
       httpStatus: whRes.status,
-      crmResponse: whBody.slice(0, 200)
+      crmResponse: whBody.slice(0, 180)
     });
   } catch (err) {
     logEvent({ status: 'webhook_error', error: err.message });
   }
 }
 
-// ============================================================================
-// MOTOR BAILEYS NATIVO v6 (Signal Cache + Snapshot Backup + Retry Counter)
-// ============================================================================
 async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
   if (!unitId) return;
 
@@ -312,15 +312,13 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     status: 'starting',
     phone: null,
     name: unitName,
-    authFolder,
-    backupTimer: null
+    authFolder
   };
 
   const session = sessions[unitId];
 
   try {
-    // Se a pasta local não existir (ex: após deploy no Render), tenta restaurar o snapshot do Supabase!
-    if (!fs.existsSync(path.join(authFolder, 'creds.json'))) {
+    if (!fs.existsSync(authFolder)) {
       await restoreFolderFromSupabase(unitId, authFolder);
     }
 
@@ -348,16 +346,14 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
 
     session.sock = sock;
 
-    let syncDebounce = null;
     sock.ev.on('creds.update', async () => {
       await saveCreds();
-      if (syncDebounce) clearTimeout(syncDebounce);
-      syncDebounce = setTimeout(() => syncFolderToSupabase(unitId, authFolder), 8000);
+      scheduleFolderBackupToSupabase(unitId, authFolder);
     });
 
     sock.ev.on('contacts.upsert', (contacts) => {
       for (const c of contacts) {
-        if (c.lid && c.id) setBoundedMap(lidToPhoneMap, c.lid, c.id, 1000);
+        if (c.lid && c.id) setBoundedMap(lidToPhoneMap, c.lid, c.id);
       }
     });
 
@@ -370,7 +366,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       }
 
       if (connection === 'close') {
-        if (session.backupTimer) clearInterval(session.backupTimer);
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const loggedOut = statusCode === DisconnectReason.loggedOut;
         session.status = 'disconnected';
@@ -391,11 +386,7 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         session.qrCodeBase64 = null;
         session.phone = sock?.user?.id?.split(':')[0] || 'Conectado';
         await updateUnitInSupabase(unitId, 'connected', session.phone);
-
-        // Faz o backup inicial após 5s e mantém atualizado a cada 40s
-        setTimeout(() => syncFolderToSupabase(unitId, authFolder), 5000);
-        if (session.backupTimer) clearInterval(session.backupTimer);
-        session.backupTimer = setInterval(() => syncFolderToSupabase(unitId, authFolder), 40000);
+        scheduleFolderBackupToSupabase(unitId, authFolder);
       }
     });
 
@@ -418,14 +409,14 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
   }
 }
 
-async function restoreAllSessions() {
+async function restoreAllSessionsOnBoot() {
   const units = await fetchUnitsFromSupabase();
   for (const unit of units) {
     const folder = `./auth_info_${unit.id}`;
-    const hasLocal = fs.existsSync(path.join(folder, 'creds.json'));
-    const hasRemote = !hasLocal ? await restoreFolderFromSupabase(unit.id, folder) : true;
+    const hasLocal = fs.existsSync(folder);
+    const restoredCloud = !hasLocal ? await restoreFolderFromSupabase(unit.id, folder) : true;
 
-    if (hasLocal || hasRemote) {
+    if (hasLocal || restoredCloud) {
       startUnitWhatsApp(unit.id, unit.name);
       await sleep(1500);
     } else if (unit.whatsapp_status === 'connected') {
@@ -434,39 +425,16 @@ async function restoreAllSessions() {
   }
 }
 
-async function sendHumanizedMessage(unitId, phoneInput, messageText) {
+async function sendHumanizedMessage(unitId, targetJid, messageText) {
   const session = sessions[unitId];
   if (!session || session.status !== 'connected' || !session.sock) {
     throw new Error('Sessão da unidade desconectada.');
   }
   const sock = session.sock;
 
-  let cleanPhone = String(phoneInput || '').replace(/\D/g, '');
-  if (!cleanPhone.startsWith('55') && cleanPhone.length <= 11) {
-    cleanPhone = `55${cleanPhone}`;
-  }
-
-  const candidates = [cleanPhone];
-  if (cleanPhone.length === 13 && cleanPhone[4] === '9') {
-    candidates.push(cleanPhone.slice(0, 4) + cleanPhone.slice(5));
-  } else if (cleanPhone.length === 12 && cleanPhone.startsWith('55')) {
-    candidates.push(cleanPhone.slice(0, 4) + '9' + cleanPhone.slice(4));
-  }
-
-  let targetJid = `${cleanPhone}@s.whatsapp.net`;
-  for (const num of candidates) {
-    try {
-      const [result] = await sock.onWhatsApp(num);
-      if (result && result.exists) {
-        targetJid = result.jid;
-        break;
-      }
-    } catch {}
-  }
-
   const textKey = String(messageText || '').trim().slice(0, 50);
   if (textKey) {
-    recentAiTexts.add(textKey);
+    addBoundedSet(recentAiTexts, textKey);
     setTimeout(() => recentAiTexts.delete(textKey), 90000);
   }
 
@@ -496,13 +464,6 @@ async function sendHumanizedMessage(unitId, phoneInput, messageText) {
     try { sock.sendPresenceUpdate('unavailable'); } catch {}
   }, 5000);
 
-  logEvent({
-    status: 'outbound_sent_ok',
-    unitName: session.name,
-    to: targetJid,
-    textPreview: String(messageText || '').slice(0, 80)
-  });
-
   return sentMsg;
 }
 
@@ -510,22 +471,16 @@ function enqueueUnitSend(unitId, taskFn) {
   if (!sendQueues[unitId]) {
     sendQueues[unitId] = Promise.resolve();
   }
-  queueCounts[unitId] = (queueCounts[unitId] || 0) + 1;
-
-  const nextTask = sendQueues[unitId]
-    .then(async () => {
-      try {
-        return await taskFn();
-      } finally {
-        queueCounts[unitId] = Math.max(0, (queueCounts[unitId] || 1) - 1);
-        await sleep(randomBetween(4500, 8500));
-      }
-    })
-    .catch((err) => {
-      logEvent({ status: 'outbound_send_error', unitId, error: err.message });
-    });
-
-  sendQueues[unitId] = nextTask;
+  const nextTask = sendQueues[unitId].then(async () => {
+    try {
+      const result = await taskFn();
+      await sleep(randomBetween(4500, 8500));
+      return result;
+    } catch (err) {
+      logEvent({ status: 'async_send_error', unitId, error: err.message });
+    }
+  });
+  sendQueues[unitId] = nextTask.catch(() => {});
   return nextTask;
 }
 
@@ -536,15 +491,13 @@ app.get('/', async (req, res) => {
   const cardsHtml = units.map((u) => {
     const s = sessions[u.id] || { status: 'idle', phone: null };
     const isConn = s.status === 'connected';
-    const qCount = queueCounts[u.id] || 0;
     return `
       <div style="background:#1e293b;padding:24px;border-radius:12px;width:290px;border:1px solid ${isConn ? '#22c55e' : '#334155'};">
         <h2 style="margin:0 0 10px 0;color:#f8fafc;font-size:20px;">📍 ${u.name}</h2>
         <p style="color:${isConn ? '#22c55e' : '#94a3b8'};font-weight:bold;min-height:24px;">
           ${isConn ? `✅ Conectado (\${s.phone})` : '⚪ Desconectado'}
         </p>
-        <p style="color:#64748b;font-size:13px;margin:4px 0 12px 0;">Fila de envio: ${qCount} msg(s)</p>
-        <a href="/connect/${u.id}" style="display:inline-block;margin-top:6px;padding:10px 20px;background:${isConn ? '#334155' : '#f97316'};color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;">
+        <a href="/connect/${u.id}" style="display:inline-block;margin-top:12px;padding:10px 20px;background:${isConn ? '#334155' : '#f97316'};color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;">
           ${isConn ? 'Ver Status / Desconectar' : '📱 Gerar QR Code'}
         </a>
       </div>
@@ -554,7 +507,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6 (Snapshot Persistente + Fila Assíncrona Anti-Timeout + Anti-Eco):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6 (Fila Assíncrona Instantânea + Snapshot Cloud + Anti-Echo):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -581,7 +534,6 @@ app.get('/connect/:unitId', async (req, res) => {
         <a href="/" style="color:#94a3b8;text-decoration:none;">← Voltar para Todas as Unidades</a>
         <h1 style="color:#22c55e;margin-top:25px;">✅ WhatsApp ${unit.name} Conectado!</h1>
         <p style="font-size:18px;">Aparelho ativo: <strong>${s.phone}</strong></p>
-        <p style="color:#94a3b8;">🛡️ Snapshot automático ativo no Supabase.</p>
         <form method="POST" action="/logout/${unit.id}" style="margin-top:30px;">
           <button type="submit" style="padding:10px 20px;background:#ef4444;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold;">
             🔌 Desconectar e Limpar Sessão
@@ -590,7 +542,123 @@ app.get('/connect/:unitId', async (req, res) => {
       </div>
     `);
   }
-  const server = app.listen(PORT, '0.0.0.0', () => {
+
+  if (s.status === 'qr_ready' && s.qrCodeBase64) {
+    return res.send(`
+      <div style="font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#fff;min-height:100vh;">
+        <a href="/" style="color:#94a3b8;text-decoration:none;">← Voltar para Todas as Unidades</a>
+        <h1 style="color:#f97316;margin-top:20px;">📱 Conectar Unidade: ${unit.name}</h1>
+        <p>Abra o WhatsApp da unidade <strong>${unit.name}</strong> > Aparelhos Conectados > Conectar um aparelho:</p>
+        <div style="background:#fff;padding:20px;display:inline-block;border-radius:16px;margin-top:15px;">
+          <img src="${s.qrCodeBase64}" style="width:280px;height:280px;" />
+        </div>
+        <p style="color:#94a3b8;margin-top:20px;">A página atualiza sozinha a cada 8 segundos.</p>
+        <script>setTimeout(() => location.reload(), 8000);</script>
+      </div>
+    `);
+  }
+
+  return res.send(`
+    <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
+      <h2>⏳ Preparando conexão para ${unit.name}...</h2>
+      <script>setTimeout(() => location.reload(), 3500);</script>
+    </div>
+  `);
+});
+
+app.post('/logout/:unitId', async (req, res) => {
+  const unitId = req.params.unitId;
+  const s = sessions[unitId];
+  if (s?.sock) {
+    try { await s.sock.logout(); } catch {}
+  }
+  if (s?.authFolder) {
+    try { fs.rmSync(s.authFolder, { recursive: true, force: true }); } catch {}
+  }
+  await deleteSnapshotFromSupabase(unitId);
+  delete sessions[unitId];
+  await updateUnitInSupabase(unitId, 'disconnected', null);
+  res.redirect('/');
+});
+
+app.get('/status', (req, res) => {
+  const summary = {};
+  for (const [id, s] of Object.entries(sessions)) {
+    summary[id] = { name: s.name, status: s.status, phone: s.phone };
+  }
+  res.json({
+    engine: 'native_multifile_v6_async_queue_snapshot',
+    active_sessions: Object.keys(sessions).length,
+    webhook_url_configured: WEBHOOK_URL,
+    units: summary,
+    last_webhook_events: recentEvents
+  });
+});
+
+app.post('/send', async (req, res) => {
+  const token = req.headers['apikey'] || req.headers['authorization']?.replace('Bearer ', '');
+  if (token !== API_KEY) return res.status(401).json({ error: 'Não autorizado' });
+
+  try {
+    const { phone, message, unitId } = req.body;
+
+    let targetUnitId = unitId && sessions[unitId]?.status === 'connected' ? unitId : null;
+    if (!targetUnitId) {
+      targetUnitId = Object.keys(sessions).find((k) => sessions[k]?.status === 'connected');
+    }
+
+    if (!targetUnitId || !sessions[targetUnitId]?.sock) {
+      return res.status(400).json({ error: 'O WhatsApp desta unidade não está conectado no momento.', unitId });
+    }
+
+    let cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone.startsWith('55') && cleanPhone.length <= 11) {
+      cleanPhone = `55${cleanPhone}`;
+    }
+
+    const textKey = String(message || '').trim().slice(0, 50);
+    if (textKey) {
+      addBoundedSet(recentAiTexts, textKey);
+      setTimeout(() => recentAiTexts.delete(textKey), 120000);
+    }
+
+    enqueueUnitSend(targetUnitId, async () => {
+      const sock = sessions[targetUnitId]?.sock;
+      if (!sock) return;
+
+      const candidates = [cleanPhone];
+      if (cleanPhone.length === 13 && cleanPhone[4] === '9') {
+        candidates.push(cleanPhone.slice(0, 4) + cleanPhone.slice(5));
+      } else if (cleanPhone.length === 12 && cleanPhone.startsWith('55')) {
+        candidates.push(cleanPhone.slice(0, 4) + '9' + cleanPhone.slice(4));
+      }
+
+      let targetJid = `${cleanPhone}@s.whatsapp.net`;
+      for (const num of candidates) {
+        try {
+          const [result] = await sock.onWhatsApp(num);
+          if (result && result.exists) {
+            targetJid = result.jid;
+            break;
+          }
+        } catch {}
+      }
+
+      return await sendHumanizedMessage(targetUnitId, targetJid, message);
+    });
+
+    return res.status(200).json({
+      status: 'queued_humanized',
+      unitIdUsed: targetUnitId,
+      unitName: sessions[targetUnitId].name,
+      phone: cleanPhone
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor Multi-Unidades v6 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
@@ -605,8 +673,4 @@ server.on('error', (e) => {
   } else {
     console.error('Erro no servidor HTTP:', e);
   }
-});
-app.listen(PORT, () => {
-  console.log(`Servidor Multi-Unidades v4 MULT CRM rodando na porta ${PORT}`);
-  restoreLocalSessions();
 });
