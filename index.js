@@ -201,6 +201,8 @@ async function updateUnitInSupabase(unitId, status, phone = null) {
 // ============================================================================
 async function processIncomingMessage(unitId, unitName, key, messageObj, pushName) {
   const remoteJid = key?.remoteJid || '';
+ // Descarta em silêncio pacotes internos vazios do próprio aparelho (evita poluir a Caixa-Preta)
+  if (!messageObj && key?.fromMe) return;
   if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) {
     return;
   }
