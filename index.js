@@ -689,9 +689,22 @@ app.post('/send', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor Multi-Unidades v6 MULT CRM rodando na porta ${PORT}`);
-  restoreAllSessions();
+  restoreAllSessionsOnBoot();
+});
+
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error(`Porta ${PORT} já está em uso, reiniciando bind...`);
+    setTimeout(() => {
+      server.close();
+      server.listen(PORT, '0.0.0.0');
+    }, 1000);
+  } else {
+    console.error('Erro no servidor HTTP:', e);
+  }
+});
 });
 app.listen(PORT, () => {
   console.log(`Servidor Multi-Unidades v4 MULT CRM rodando na porta ${PORT}`);
