@@ -77,14 +77,52 @@ function logEvent(info) {
   if (recentEvents.length > 40) recentEvents.pop();
 }
 
+function getPhoneVariants(rawPhone) {
+  const clean = String(rawPhone || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+  if (!clean) return [];
+  const variants = new Set([clean]);
+  if (!clean.startsWith('55') && (clean.length === 10 || clean.length === 11)) {
+    variants.add(`55${clean}`);
+  }
+  for (const num of Array.from(variants)) {
+    if (num.startsWith('55')) {
+      if (num.length === 13 && num[4] === '9') {
+        variants.add(num.slice(0, 4) + num.slice(5));
+      } else if (num.length === 12) {
+        variants.add(num.slice(0, 4) + '9' + num.slice(4));
+      }
+    }
+  }
+  return Array.from(variants);
+}
+
 function registerLidMapping(lidJid, phoneJid) {
   if (!lidJid || !phoneJid) return;
   const cleanLid = String(lidJid).trim();
   const cleanPhone = String(phoneJid).split('@')[0].split(':')[0].replace(/\D/g, '');
   if (cleanLid.includes('@lid') && cleanPhone.length >= 10) {
     setBoundedMap(lidToPhoneMap, cleanLid, cleanPhone);
-    setBoundedMap(phoneToLidMap, cleanPhone, cleanLid);
+    for (const variant of getPhoneVariants(cleanPhone)) {
+      setBoundedMap(phoneToLidMap, variant, cleanLid);
+    }
   }
+}
+
+// Purga arquivos de sessão Signal corrompidos de um contato específico sem desconectar o aparelho
+function purgeCorruptedContactSession(authFolder, jidOrPhone) {
+  try {
+    if (!authFolder || !fs.existsSync(authFolder)) return;
+    const rawId = String(jidOrPhone || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (!rawId || rawId.length < 6) return;
+    const files = fs.readdirSync(authFolder);
+    for (const file of files) {
+      if (file.startsWith('session-') && file.includes(rawId)) {
+        try {
+          fs.unlinkSync(path.join(authFolder, file));
+        } catch {}
+      }
+    }
+  } catch {}
 }
 
 function extractMessageText(messageObj) {
@@ -109,6 +147,7 @@ function extractMessageText(messageObj) {
   );
 }
 
+// Salva apenas creds.json e pre-keys essenciais para não restaurar sessões E2E corrompidas no boot
 async function scheduleFolderBackupToSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return;
   if (backupTimers[unitId]) clearTimeout(backupTimers[unitId]);
@@ -119,12 +158,14 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
       const files = fs.readdirSync(authFolder);
       const snapshot = {};
       for (const file of files) {
+        // Ignora arquivos 'session-*' e 'sender-key-*' no backup da nuvem para forçar chaves limpas após redeploy
+        if (file.startsWith('session-') || file.startsWith('sender-key-')) continue;
         const fullPath = path.join(authFolder, file);
         if (fs.statSync(fullPath).isFile()) {
           snapshot[file] = fs.readFileSync(fullPath, 'utf-8');
         }
       }
-      if (Object.keys(snapshot).length === 0) return;
+      if (!snapshot['creds.json']) return;
 
       await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions`, {
         method: 'POST',
@@ -163,6 +204,8 @@ async function restoreFolderFromSupabase(unitId, authFolder) {
 
     fs.mkdirSync(authFolder, { recursive: true });
     for (const [fileName, content] of Object.entries(snapshot)) {
+      // Nunca restaura sessões individuais antigas de contatos para evitar Bad MAC / Aguardando Mensagem
+      if (fileName.startsWith('session-') || fileName.startsWith('sender-key-')) continue;
       if (typeof content === 'string') {
         fs.writeFileSync(path.join(authFolder, fileName), content, 'utf-8');
       }
@@ -286,10 +329,13 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   const fromMe = Boolean(key.fromMe);
   const senderName = pushName || 'Lead WhatsApp';
 
-  // SE A MENSAGEM VEIO COM ENVELOPE CRIPTOGRAFADO (@LID RETRY), AGUARDAMOS 4 SEGUNDOS PELO RETRY
-  // SE O WHATSAPP NÃO ENTREGAR O TEXTO MAS TIVERMOS O TELEFONE REAL (senderPn), SALVAMOS O LEAD NO CRM!
   if (!messageObj) {
     if (!fromMe) {
+      // Limpa imediatamente o arquivo session-* corrompido deste contato para destravar o retry e o envio
+      const authFolder = sessions[unitId]?.authFolder;
+      purgeCorruptedContactSession(authFolder, remoteJid);
+      if (phone) purgeCorruptedContactSession(authFolder, phone);
+
       logEvent({ status: 'decrypt_retry_requested_lead', remoteJid, phone, key });
       if (phone && msgId && !pendingRetryTimers.has(msgId)) {
         const timer = setTimeout(async () => {
@@ -313,7 +359,6 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
     return;
   }
 
-  // Se a mensagem destravou a tempo pelo retry, cancela o timer de fallback
   if (msgId && pendingRetryTimers.has(msgId)) {
     clearTimeout(pendingRetryTimers.get(msgId));
     pendingRetryTimers.delete(msgId);
@@ -389,7 +434,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       printQRInTerminal: false,
       logger,
       browser: Browsers.macOS('Desktop'),
-      // ESSENCIAL PARA CONTAS COMERCIAIS COM @LID E WHATSAPP WEB SIMULTÂNEO:
       markOnlineOnConnect: true,
       syncFullHistory: false,
       fireInitQueries: true,
@@ -471,7 +515,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify' && m.type !== 'append') return;
       for (const msg of m.messages) {
-        // Ignora mensagens antigas de sincronização (mais velhas que 2 minutos)
         const msgTimestamp = Number(msg.messageTimestamp || 0);
         const nowSec = Math.floor(Date.now() / 1000);
         if (m.type === 'append' && msgTimestamp > 0 && (nowSec - msgTimestamp) > 120) {
@@ -590,7 +633,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.3 (Suporte Nativo @LID Comercial + Salva-Vidas de Lead):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.4 (Roteamento Direto @LID Comercial + Auto-Purge de Sessão):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -675,7 +718,7 @@ app.get('/status', (req, res) => {
     summary[id] = { name: s.name, status: s.status, phone: s.phone };
   }
   res.json({
-    engine: 'native_multifile_v6.3_lid_commercial',
+    engine: 'native_multifile_v6.4_lid_direct_autopurge',
     active_sessions: Object.keys(sessions).length,
     webhook_url_configured: WEBHOOK_URL,
     units: summary,
@@ -688,7 +731,7 @@ app.post('/send', async (req, res) => {
   if (token !== API_KEY) return res.status(401).json({ error: 'Não autorizado' });
 
   try {
-    const { phone, message, unitId } = req.body;
+    const { phone, remoteJid, message, unitId } = req.body;
 
     let targetUnitId = unitId && sessions[unitId]?.status === 'connected' ? unitId : null;
     if (!targetUnitId) {
@@ -714,22 +757,31 @@ app.post('/send', async (req, res) => {
       const sock = sessions[targetUnitId]?.sock;
       if (!sock) return;
 
-      const candidates = [cleanPhone];
-      if (cleanPhone.length === 13 && cleanPhone[4] === '9') {
-        candidates.push(cleanPhone.slice(0, 4) + cleanPhone.slice(5));
-      } else if (cleanPhone.length === 12 && cleanPhone.startsWith('55')) {
-        candidates.push(cleanPhone.slice(0, 4) + '9' + cleanPhone.slice(4));
-      }
+      const candidates = getPhoneVariants(cleanPhone);
 
-      let targetJid = `${cleanPhone}@s.whatsapp.net`;
-      for (const num of candidates) {
-        try {
-          const [result] = await sock.onWhatsApp(num);
-          if (result && result.exists) {
-            targetJid = result.jid;
+      // 1º PRIORIDADE: Se o lead interagiu via @lid no WhatsApp Comercial, envia diretamente no @lid da conversa!
+      let mappedLid = remoteJid && String(remoteJid).includes('@lid') ? String(remoteJid).trim() : null;
+      if (!mappedLid) {
+        for (const num of candidates) {
+          if (phoneToLidMap.has(num)) {
+            mappedLid = phoneToLidMap.get(num);
             break;
           }
-        } catch {}
+        }
+      }
+
+      let targetJid = mappedLid || `${cleanPhone}@s.whatsapp.net`;
+
+      if (!mappedLid) {
+        for (const num of candidates) {
+          try {
+            const [result] = await sock.onWhatsApp(num);
+            if (result && result.exists) {
+              targetJid = result.jid;
+              break;
+            }
+          } catch {}
+        }
       }
 
       const sent = await sendHumanizedMessage(targetUnitId, targetJid, message);
@@ -737,6 +789,7 @@ app.post('/send', async (req, res) => {
         status: 'outbound_sent_ok',
         unitId: targetUnitId,
         targetJid,
+        usedLid: Boolean(mappedLid),
         msgId: sent?.key?.id || null
       });
       return sent;
@@ -754,7 +807,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v6.3 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v6.4 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
