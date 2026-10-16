@@ -13,7 +13,7 @@ import path from 'path';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = (process.env.API_KEY || 'multZap2026!secret').trim();
@@ -27,11 +27,12 @@ const sessions = {};
 const sendQueues = {};
 const backupTimers = {};
 
+// Estruturas enxutas com limite rígido de memória RAM
 const sentMessagesCache = new Map();
 const recentAiTexts = new Set();
 const processedMsgIds = new Set();
 const lidToPhoneMap = new Map();
-const humanHandledContacts = new Map();
+const externalHumanChats = new Map(); // Contatos chamados pela equipe que não estão no CRM
 const msgRetryCounterMap = new Map();
 
 let cachedUnits = [];
@@ -45,7 +46,7 @@ const msgRetryCounterCache = {
   get: (key) => msgRetryCounterMap.get(key),
   set: (key, value) => {
     msgRetryCounterMap.set(key, value);
-    if (msgRetryCounterMap.size > 2000) {
+    if (msgRetryCounterMap.size > 800) {
       const firstKey = msgRetryCounterMap.keys().next().value;
       msgRetryCounterMap.delete(firstKey);
     }
@@ -54,7 +55,7 @@ const msgRetryCounterCache = {
   flushAll: () => msgRetryCounterMap.clear()
 };
 
-function setBoundedMap(map, key, value, maxSize = 2500) {
+function setBoundedMap(map, key, value, maxSize = 1000) {
   map.set(key, value);
   if (map.size > maxSize) {
     const firstKey = map.keys().next().value;
@@ -62,7 +63,7 @@ function setBoundedMap(map, key, value, maxSize = 2500) {
   }
 }
 
-function addBoundedSet(set, value, maxSize = 2500) {
+function addBoundedSet(set, value, maxSize = 1000) {
   set.add(value);
   if (set.size > maxSize) {
     const firstVal = set.values().next().value;
@@ -72,7 +73,7 @@ function addBoundedSet(set, value, maxSize = 2500) {
 
 function logEvent(info) {
   recentEvents.unshift({ time: new Date().toISOString(), ...info });
-  if (recentEvents.length > 40) recentEvents.pop();
+  if (recentEvents.length > 30) recentEvents.pop();
 }
 
 function getPhoneVariants(rawPhone) {
@@ -99,32 +100,29 @@ function registerLidMapping(lidJid, phoneJid) {
   const cleanLid = String(lidJid).trim();
   const cleanPhone = String(phoneJid).split('@')[0].split(':')[0].replace(/\D/g, '');
   if (cleanLid.includes('@lid') && cleanPhone.length >= 10) {
-    setBoundedMap(lidToPhoneMap, cleanLid, cleanPhone);
+    setBoundedMap(lidToPhoneMap, cleanLid, cleanPhone, 1500);
   }
 }
 
-// Marca um contato (telefone + variações + LID) como já atendido por humano nas últimas 24h
-function markContactAsHumanHandled(phone, remoteJid) {
+function markAsExternalHumanChat(phone, remoteJid) {
   const now = Date.now();
-  if (remoteJid) {
-    setBoundedMap(humanHandledContacts, String(remoteJid).trim(), now);
-  }
+  if (remoteJid) setBoundedMap(externalHumanChats, String(remoteJid).trim(), now, 1000);
   if (phone) {
     for (const v of getPhoneVariants(phone)) {
-      setBoundedMap(humanHandledContacts, v, now);
+      setBoundedMap(externalHumanChats, v, now, 1000);
     }
   }
 }
 
-function isContactHumanHandled(phone, remoteJid) {
-  const ttlMs = 24 * 60 * 60 * 1000; // 24 horas de proteção para conversas humanas em andamento
+function isExternalHumanChat(phone, remoteJid) {
+  const ttlMs = 24 * 60 * 60 * 1000; // Protege a conversa humana por 24h
   const now = Date.now();
-  if (remoteJid && humanHandledContacts.has(String(remoteJid).trim())) {
-    if (now - humanHandledContacts.get(String(remoteJid).trim()) < ttlMs) return true;
+  if (remoteJid && externalHumanChats.has(String(remoteJid).trim())) {
+    if (now - externalHumanChats.get(String(remoteJid).trim()) < ttlMs) return true;
   }
   if (phone) {
     for (const v of getPhoneVariants(phone)) {
-      if (humanHandledContacts.has(v) && (now - humanHandledContacts.get(v) < ttlMs)) {
+      if (externalHumanChats.has(v) && (now - externalHumanChats.get(v) < ttlMs)) {
         return true;
       }
     }
@@ -154,6 +152,7 @@ function extractMessageText(messageObj) {
   );
 }
 
+// BACKUP ULTRA-LEVE: Salva apenas creds.json e chaves mestre (menos de 50KB na RAM)
 async function scheduleFolderBackupToSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return;
   if (backupTimers[unitId]) clearTimeout(backupTimers[unitId]);
@@ -164,6 +163,10 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
       const files = fs.readdirSync(authFolder);
       const snapshot = {};
       for (const file of files) {
+        // Ignora arquivos voláteis por contato para não pesar memória RAM nem restaurar Bad MAC
+        if (file.startsWith('session-') || file.startsWith('sender-key-') || file.startsWith('pre-key-')) {
+          continue;
+        }
         const fullPath = path.join(authFolder, file);
         if (fs.statSync(fullPath).isFile()) {
           snapshot[file] = fs.readFileSync(fullPath, 'utf-8');
@@ -189,9 +192,9 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
         ])
       });
     } catch (err) {
-      console.error(`[${unitId}] Erro no backup snapshot:`, err.message);
+      console.error(`[${unitId}] Erro no backup leve:`, err.message);
     }
-  }, 6000);
+  }, 10000);
 }
 
 async function restoreFolderFromSupabase(unitId, authFolder) {
@@ -208,6 +211,7 @@ async function restoreFolderFromSupabase(unitId, authFolder) {
 
     fs.mkdirSync(authFolder, { recursive: true });
     for (const [fileName, content] of Object.entries(snapshot)) {
+      if (fileName.startsWith('session-') || fileName.startsWith('sender-key-')) continue;
       if (typeof content === 'string') {
         fs.writeFileSync(path.join(authFolder, fileName), content, 'utf-8');
       }
@@ -280,6 +284,13 @@ async function forwardToCrmWebhook({ unitId, unitName, phone, remoteJid, senderN
       })
     });
     const whBody = await whRes.text();
+
+    // Se a consultora enviou mensagem manual (fromMe: true) e o CRM respondeu que NÃO existe lead para esse número,
+    // marcamos como conversa humana externa (ex: aluno já matriculado) para que a resposta dele não crie card nem acione a IA!
+    if (fromMe && whBody.includes('ignored_outbound_without_lead')) {
+      markAsExternalHumanChat(phone, remoteJid);
+    }
+
     logEvent({
       status: 'delivered_to_crm',
       unitName,
@@ -314,7 +325,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   if (!messageObj && key?.fromMe) return;
 
   if (msgId && sentMessagesCache.has(msgId)) {
-    addBoundedSet(processedMsgIds, msgId);
+    addBoundedSet(processedMsgIds, msgId, 800);
     logEvent({ status: 'ignored_ai_outbound_echo_by_id', msgId });
     return;
   }
@@ -331,8 +342,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   const fromMe = Boolean(key.fromMe);
   const senderName = pushName || 'Lead WhatsApp';
 
-  // Se o pacote ainda está aguardando retry de descriptografia do Baileys, apenas registra no log
-  // NUNCA inventa mensagem falsa para não disparar boas-vindas em conversas humanas em andamento!
+  // Se o Baileys pediu retry de descriptografia, aguarda o evento nativo messages.update sem inventar texto falso
   if (!messageObj) {
     if (!fromMe) {
       logEvent({ status: 'decrypt_retry_waiting', remoteJid, phone, msgId });
@@ -348,28 +358,30 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
 
   if (!phone || !text) {
     if (!fromMe) {
-      logEvent({ status: 'ignored_non_text_or_unmapped_lid', remoteJid, phone, keys: Object.keys(messageObj || {}) });
+      logEvent({ status: 'ignored_non_text_or_unmapped_lid', remoteJid, phone });
     }
     return;
   }
 
   const textSignature = text.trim().slice(0, 50);
   if (fromMe && recentAiTexts.has(textSignature)) {
-    if (msgId) addBoundedSet(processedMsgIds, msgId);
+    if (msgId) addBoundedSet(processedMsgIds, msgId, 800);
     logEvent({ status: 'ignored_ai_outbound_echo_by_text', phone });
     return;
   }
 
-  if (msgId) addBoundedSet(processedMsgIds, msgId);
+  if (msgId) addBoundedSet(processedMsgIds, msgId, 800);
 
-  // TRAVA ANTI-INVASÃO EM CONVERSAS EM ANDAMENTO:
-  // 1) Se a mensagem foi enviada manualmente pela equipe (ex: Camilla), marca o contato como "Atendimento Humano Ativo"
-  if (fromMe) {
-    markContactAsHumanHandled(phone, remoteJid);
-  } else if (isContactHumanHandled(phone, remoteJid)) {
-    // 2) Se o contato está respondendo à Camilla, avisa o CRM mas se o card não existir ainda,
-    // evita que o CRM trate como um "Lead Novo" pedindo boas-vindas da IA!
-    logEvent({ status: 'human_conversation_reply_detected', phone, remoteJid, text });
+  // BLOQUEIO IMEDIATO NA MEMÓRIA: Se for resposta de um aluno/contato que a consultora chamou primeiro (fora do CRM),
+  // ignora antes de chamar a Vercel para nunca disparar boas-vindas da IA no meio da conversa!
+  if (!fromMe && isExternalHumanChat(phone, remoteJid)) {
+    logEvent({
+      status: 'blocked_reply_to_human_external_chat',
+      phone,
+      remoteJid,
+      text
+    });
+    return;
   }
 
   await forwardToCrmWebhook({
@@ -413,13 +425,13 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
 
     const sock = makeWASocket({
       version,
-      // Usamos state.keys diretamente sem cache intermediário para evitar dessincronização Bad MAC no Comercial
-      auth: state,
+      auth: state, // Leitura direta de disco: menor uso de RAM e zero conflito de cache Signal
       printQRInTerminal: false,
       logger,
       browser: Browsers.ubuntu('Chrome'),
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
       fireInitQueries: true,
       generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
@@ -451,22 +463,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     sock.ev.on('contacts.update', (updates) => {
       for (const c of updates) {
         if (c.lid && c.id) registerLidMapping(c.lid, c.id);
-      }
-    });
-
-    sock.ev.on('messaging-history.set', ({ contacts, messages }) => {
-      if (Array.isArray(contacts)) {
-        for (const c of contacts) {
-          if (c.lid && c.id) registerLidMapping(c.lid, c.id);
-        }
-      }
-      // Registra conversas já ativas no histórico recente como atendidas por humanos
-      if (Array.isArray(messages)) {
-        for (const m of messages) {
-          if (m?.key?.fromMe && m?.key?.remoteJid) {
-            markContactAsHumanHandled(m.key.participantPn || m.key.senderPn, m.key.remoteJid);
-          }
-        }
       }
     });
 
@@ -510,10 +506,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         const msgTimestamp = Number(msg.messageTimestamp || 0);
         const nowSec = Math.floor(Date.now() / 1000);
         if (m.type === 'append' && msgTimestamp > 0 && (nowSec - msgTimestamp) > 90) {
-          // Se for mensagem antiga enviada pela equipe durante sync, apenas protege o contato contra IA
-          if (msg.key?.fromMe) {
-            markContactAsHumanHandled(msg.key?.senderPn, msg.key?.remoteJid);
-          }
           continue;
         }
         await processIncomingMessage(unitId, unitName, msg.key, msg.message, msg.pushName);
@@ -557,7 +549,7 @@ async function sendHumanizedMessage(unitId, targetJid, messageText) {
 
   const textKey = String(messageText || '').trim().slice(0, 50);
   if (textKey) {
-    addBoundedSet(recentAiTexts, textKey);
+    addBoundedSet(recentAiTexts, textKey, 500);
     setTimeout(() => recentAiTexts.delete(textKey), 90000);
   }
 
@@ -580,7 +572,7 @@ async function sendHumanizedMessage(unitId, targetJid, messageText) {
   const sentMsg = await sock.sendMessage(targetJid, { text: messageText });
 
   if (sentMsg?.key?.id) {
-    setBoundedMap(sentMessagesCache, sentMsg.key.id, messageText, 500);
+    setBoundedMap(sentMessagesCache, sentMsg.key.id, messageText, 300);
   }
 
   return sentMsg;
@@ -629,7 +621,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.5 (Proteção de Conversas em Andamento + Entrega @s.whatsapp.net):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.6 Ultra-Light (Anti-Invasão Humana + Baixa RAM + @s.whatsapp.net):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -713,8 +705,10 @@ app.get('/status', (req, res) => {
   for (const [id, s] of Object.entries(sessions)) {
     summary[id] = { name: s.name, status: s.status, phone: s.phone };
   }
+  const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v6.5_anti_invasion_swhatsapp',
+    engine: 'native_multifile_v6.6_ultralight',
+    memory_rss_mb: `${memMb} MB`,
     active_sessions: Object.keys(sessions).length,
     webhook_url_configured: WEBHOOK_URL,
     units: summary,
@@ -745,7 +739,7 @@ app.post('/send', async (req, res) => {
 
     const textKey = String(message || '').trim().slice(0, 50);
     if (textKey) {
-      addBoundedSet(recentAiTexts, textKey);
+      addBoundedSet(recentAiTexts, textKey, 500);
       setTimeout(() => recentAiTexts.delete(textKey), 120000);
     }
 
@@ -755,7 +749,7 @@ app.post('/send', async (req, res) => {
 
       const candidates = getPhoneVariants(cleanPhone);
 
-      // SEMPRE envia para o JID padrão @s.whatsapp.net resolvido pelo onWhatsApp (evita 1 risquinho do @lid)
+      // Envia sempre para o JID clássico @s.whatsapp.net resolvido pelo onWhatsApp (2 risquinhos garantidos)
       let targetJid = `${cleanPhone}@s.whatsapp.net`;
 
       for (const num of candidates) {
@@ -791,7 +785,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v6.5 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v6.6 Ultra-Light MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
