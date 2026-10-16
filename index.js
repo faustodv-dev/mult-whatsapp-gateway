@@ -590,106 +590,7 @@ app.get('/connect/:unitId', async (req, res) => {
       </div>
     `);
   }
-
-  if (s.status === 'qr_ready' && s.qrCodeBase64) {
-    return res.send(`
-      <div style="font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#fff;min-height:100vh;">
-        <a href="/" style="color:#94a3b8;text-decoration:none;">← Voltar para Todas as Unidades</a>
-        <h1 style="color:#f97316;margin-top:20px;">📱 Conectar Unidade: ${unit.name}</h1>
-        <p>Abra o WhatsApp da unidade <strong>${unit.name}</strong> > Aparelhos Conectados > Conectar um aparelho:</p>
-        <div style="background:#fff;padding:20px;display:inline-block;border-radius:16px;margin-top:15px;">
-          <img src="${s.qrCodeBase64}" style="width:280px;height:280px;" />
-        </div>
-        <p style="color:#94a3b8;margin-top:20px;">A página atualiza sozinha a cada 8 segundos.</p>
-        <script>setTimeout(() => location.reload(), 8000);</script>
-      </div>
-    `);
-  }
-
-  return res.send(`
-    <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
-      <h2>⏳ Preparando conexão para ${unit.name}...</h2>
-      <script>setTimeout(() => location.reload(), 3500);</script>
-    </div>
-  `);
-});
-
-app.post('/logout/:unitId', async (req, res) => {
-  const unitId = req.params.unitId;
-  const s = sessions[unitId];
-  if (s?.backupTimer) clearInterval(s.backupTimer);
-  if (s?.sock) {
-    try { await s.sock.logout(); } catch {}
-  }
-  if (s?.authFolder) {
-    try { fs.rmSync(s.authFolder, { recursive: true, force: true }); } catch {}
-  }
-  await deleteSnapshotFromSupabase(unitId);
-  delete sessions[unitId];
-  await updateUnitInSupabase(unitId, 'disconnected', null);
-  res.redirect('/');
-});
-
-app.get('/status', (req, res) => {
-  const summary = {};
-  for (const [id, s] of Object.entries(sessions)) {
-    summary[id] = {
-      name: s.name,
-      status: s.status,
-      phone: s.phone,
-      queued_messages: queueCounts[id] || 0
-    };
-  }
-  res.json({
-    engine: 'native_multifile_v6_snapshot_async_queue',
-    active_sessions: Object.keys(sessions).length,
-    webhook_url_configured: WEBHOOK_URL,
-    units: summary,
-    last_webhook_events: recentEvents
-  });
-});
-
-// ROTA /SEND ASSÍNCRONA: Valida a sessão, enfileira o disparo com digitação humana e responde em 0.01s!
-app.post('/send', async (req, res) => {
-  const token = req.headers['apikey'] || req.headers['authorization']?.replace('Bearer ', '');
-  if (token !== API_KEY) return res.status(401).json({ error: 'Não autorizado' });
-
-  try {
-    const { phone, message, unitId } = req.body;
-    if (!phone || !message) {
-      return res.status(400).json({ error: 'Telefone e mensagem são obrigatórios.' });
-    }
-
-    let targetUnitId = unitId && sessions[unitId]?.status === 'connected' ? unitId : null;
-    if (!targetUnitId) {
-      targetUnitId = Object.keys(sessions).find((k) => sessions[k]?.status === 'connected');
-    }
-
-    if (!targetUnitId || !sessions[targetUnitId]?.sock) {
-      return res.status(400).json({ error: 'O WhatsApp desta unidade não está conectado no momento.', unitId });
-    }
-
-    const textKey = String(message || '').trim().slice(0, 50);
-    if (textKey) {
-      recentAiTexts.add(textKey);
-      setTimeout(() => recentAiTexts.delete(textKey), 90000);
-    }
-
-    // Coloca na fila sem bloquear a resposta HTTP (Fim definitivo do Timeout na Edge Function e Vercel!)
-    enqueueUnitSend(targetUnitId, () => sendHumanizedMessage(targetUnitId, phone, message));
-
-    return res.status(200).json({
-      status: 'queued_humanized',
-      unitIdUsed: targetUnitId,
-      unitName: sessions[targetUnitId].name,
-      queuePosition: queueCounts[targetUnitId] || 1
-    });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-const server = app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor Multi-Unidades v6 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
@@ -704,7 +605,6 @@ server.on('error', (e) => {
   } else {
     console.error('Erro no servidor HTTP:', e);
   }
-});
 });
 app.listen(PORT, () => {
   console.log(`Servidor Multi-Unidades v4 MULT CRM rodando na porta ${PORT}`);
