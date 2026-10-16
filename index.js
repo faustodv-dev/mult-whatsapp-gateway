@@ -27,11 +27,13 @@ const SUPABASE_KEY = (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_R
 const sessions = {};
 const sendQueues = {};
 const backupTimers = {};
+const pendingRetryTimers = new Map();
 
 const sentMessagesCache = new Map();
 const recentAiTexts = new Set();
 const processedMsgIds = new Set();
 const lidToPhoneMap = new Map();
+const phoneToLidMap = new Map();
 const msgRetryCounterMap = new Map();
 
 let cachedUnits = [];
@@ -54,7 +56,7 @@ const msgRetryCounterCache = {
   flushAll: () => msgRetryCounterMap.clear()
 };
 
-function setBoundedMap(map, key, value, maxSize = 1500) {
+function setBoundedMap(map, key, value, maxSize = 2000) {
   map.set(key, value);
   if (map.size > maxSize) {
     const firstKey = map.keys().next().value;
@@ -62,7 +64,7 @@ function setBoundedMap(map, key, value, maxSize = 1500) {
   }
 }
 
-function addBoundedSet(set, value, maxSize = 1500) {
+function addBoundedSet(set, value, maxSize = 2000) {
   set.add(value);
   if (set.size > maxSize) {
     const firstVal = set.values().next().value;
@@ -72,7 +74,17 @@ function addBoundedSet(set, value, maxSize = 1500) {
 
 function logEvent(info) {
   recentEvents.unshift({ time: new Date().toISOString(), ...info });
-  if (recentEvents.length > 35) recentEvents.pop();
+  if (recentEvents.length > 40) recentEvents.pop();
+}
+
+function registerLidMapping(lidJid, phoneJid) {
+  if (!lidJid || !phoneJid) return;
+  const cleanLid = String(lidJid).trim();
+  const cleanPhone = String(phoneJid).split('@')[0].split(':')[0].replace(/\D/g, '');
+  if (cleanLid.includes('@lid') && cleanPhone.length >= 10) {
+    setBoundedMap(lidToPhoneMap, cleanLid, cleanPhone);
+    setBoundedMap(phoneToLidMap, cleanPhone, cleanLid);
+  }
 }
 
 function extractMessageText(messageObj) {
@@ -207,66 +219,7 @@ async function updateUnitInSupabase(unitId, status, phone = null) {
   } catch {}
 }
 
-async function processIncomingMessage(unitId, unitName, key, messageObj, pushName) {
-  const remoteJid = key?.remoteJid || '';
-  if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) {
-    return;
-  }
-
-  const msgId = key?.id;
-  if (msgId && processedMsgIds.has(msgId)) return;
-
-  if (!messageObj && key?.fromMe) return;
-
-  if (msgId && sentMessagesCache.has(msgId)) {
-    addBoundedSet(processedMsgIds, msgId);
-    logEvent({ status: 'ignored_ai_outbound_echo_by_id', msgId });
-    return;
-  }
-
-  if (!messageObj) {
-    if (!key?.fromMe) {
-      logEvent({ status: 'decrypt_retry_requested_lead', remoteJid, key });
-    }
-    return;
-  }
-
-  if (messageObj.protocolMessage || messageObj.senderKeyDistributionMessage || messageObj.reactionMessage) {
-    return;
-  }
-
-  if (key.senderPn && remoteJid.includes('@lid')) {
-    setBoundedMap(lidToPhoneMap, remoteJid, key.senderPn);
-  }
-  const mappedJid = lidToPhoneMap.get(remoteJid) || '';
-  const rawPhone =
-    key.senderPn ||
-    key.participantPn ||
-    key.remoteJidAlt ||
-    mappedJid ||
-    remoteJid;
-
-  const phone = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
-  const fromMe = Boolean(key.fromMe);
-  const senderName = pushName || 'Lead WhatsApp';
-  const text = extractMessageText(messageObj);
-
-  if (!phone || !text) {
-    if (!fromMe) {
-      logEvent({ status: 'ignored_non_text', remoteJid, phone, keys: Object.keys(messageObj || {}) });
-    }
-    return;
-  }
-
-  const textSignature = text.trim().slice(0, 50);
-  if (fromMe && recentAiTexts.has(textSignature)) {
-    if (msgId) addBoundedSet(processedMsgIds, msgId);
-    logEvent({ status: 'ignored_ai_outbound_echo_by_text', phone });
-    return;
-  }
-
-  if (msgId) addBoundedSet(processedMsgIds, msgId);
-
+async function forwardToCrmWebhook({ unitId, unitName, phone, remoteJid, senderName, text, fromMe }) {
   try {
     const whRes = await fetch(WEBHOOK_URL, {
       method: 'POST',
@@ -295,6 +248,108 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   } catch (err) {
     logEvent({ status: 'webhook_error', error: err.message });
   }
+}
+
+async function processIncomingMessage(unitId, unitName, key, messageObj, pushName) {
+  const remoteJid = key?.remoteJid || '';
+  if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) {
+    return;
+  }
+
+  if (key.senderPn && remoteJid.includes('@lid')) {
+    registerLidMapping(remoteJid, key.senderPn);
+  }
+  if (key.remoteJidAlt && remoteJid.includes('@lid')) {
+    registerLidMapping(remoteJid, key.remoteJidAlt);
+  }
+
+  const msgId = key?.id;
+  if (msgId && processedMsgIds.has(msgId)) return;
+
+  if (!messageObj && key?.fromMe) return;
+
+  if (msgId && sentMessagesCache.has(msgId)) {
+    addBoundedSet(processedMsgIds, msgId);
+    logEvent({ status: 'ignored_ai_outbound_echo_by_id', msgId });
+    return;
+  }
+
+  const mappedPhone = lidToPhoneMap.get(remoteJid) || '';
+  const rawPhone =
+    key.senderPn ||
+    key.participantPn ||
+    key.remoteJidAlt ||
+    mappedPhone ||
+    (remoteJid.includes('@lid') ? '' : remoteJid);
+
+  const phone = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
+  const fromMe = Boolean(key.fromMe);
+  const senderName = pushName || 'Lead WhatsApp';
+
+  // SE A MENSAGEM VEIO COM ENVELOPE CRIPTOGRAFADO (@LID RETRY), AGUARDAMOS 4 SEGUNDOS PELO RETRY
+  // SE O WHATSAPP NÃO ENTREGAR O TEXTO MAS TIVERMOS O TELEFONE REAL (senderPn), SALVAMOS O LEAD NO CRM!
+  if (!messageObj) {
+    if (!fromMe) {
+      logEvent({ status: 'decrypt_retry_requested_lead', remoteJid, phone, key });
+      if (phone && msgId && !pendingRetryTimers.has(msgId)) {
+        const timer = setTimeout(async () => {
+          pendingRetryTimers.delete(msgId);
+          if (processedMsgIds.has(msgId)) return;
+          addBoundedSet(processedMsgIds, msgId);
+          logEvent({ status: 'lid_fallback_triggered_to_crm', phone, remoteJid });
+          await forwardToCrmWebhook({
+            unitId,
+            unitName,
+            phone,
+            remoteJid,
+            senderName,
+            text: 'Olá! Gostaria de saber mais informações sobre os cursos.',
+            fromMe: false
+          });
+        }, 4500);
+        pendingRetryTimers.set(msgId, timer);
+      }
+    }
+    return;
+  }
+
+  // Se a mensagem destravou a tempo pelo retry, cancela o timer de fallback
+  if (msgId && pendingRetryTimers.has(msgId)) {
+    clearTimeout(pendingRetryTimers.get(msgId));
+    pendingRetryTimers.delete(msgId);
+  }
+
+  if (messageObj.protocolMessage || messageObj.senderKeyDistributionMessage || messageObj.reactionMessage) {
+    return;
+  }
+
+  const text = extractMessageText(messageObj);
+
+  if (!phone || !text) {
+    if (!fromMe) {
+      logEvent({ status: 'ignored_non_text_or_unmapped_lid', remoteJid, phone, keys: Object.keys(messageObj || {}) });
+    }
+    return;
+  }
+
+  const textSignature = text.trim().slice(0, 50);
+  if (fromMe && recentAiTexts.has(textSignature)) {
+    if (msgId) addBoundedSet(processedMsgIds, msgId);
+    logEvent({ status: 'ignored_ai_outbound_echo_by_text', phone });
+    return;
+  }
+
+  if (msgId) addBoundedSet(processedMsgIds, msgId);
+
+  await forwardToCrmWebhook({
+    unitId,
+    unitName,
+    phone,
+    remoteJid,
+    senderName,
+    text,
+    fromMe
+  });
 }
 
 async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
@@ -333,23 +388,22 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       },
       printQRInTerminal: false,
       logger,
-      browser: Browsers.ubuntu('Chrome'),
-      markOnlineOnConnect: false,
-      generateHighQualityLinkPreview: false,
-      // BLINDAGEM PARA MULTI-DISPOSITIVOS / WHATSAPP WEB SIMULTÂNEO
+      browser: Browsers.macOS('Desktop'),
+      // ESSENCIAL PARA CONTAS COMERCIAIS COM @LID E WHATSAPP WEB SIMULTÂNEO:
+      markOnlineOnConnect: true,
       syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
       fireInitQueries: true,
+      generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
-      keepAliveIntervalMs: 25000,
+      keepAliveIntervalMs: 20000,
       msgRetryCounterCache,
       getMessage: async (key) => {
         const cachedText = sentMessagesCache.get(key.id);
         if (cachedText) {
           return { conversation: cachedText };
         }
-        return { conversation: 'Olá! Como podemos ajudar você hoje na MULT Profissões?' };
+        return undefined;
       }
     });
 
@@ -362,7 +416,21 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
 
     sock.ev.on('contacts.upsert', (contacts) => {
       for (const c of contacts) {
-        if (c.lid && c.id) setBoundedMap(lidToPhoneMap, c.lid, c.id);
+        if (c.lid && c.id) registerLidMapping(c.lid, c.id);
+      }
+    });
+
+    sock.ev.on('contacts.update', (updates) => {
+      for (const c of updates) {
+        if (c.lid && c.id) registerLidMapping(c.lid, c.id);
+      }
+    });
+
+    sock.ev.on('messaging-history.set', ({ contacts }) => {
+      if (Array.isArray(contacts)) {
+        for (const c of contacts) {
+          if (c.lid && c.id) registerLidMapping(c.lid, c.id);
+        }
       }
     });
 
@@ -403,6 +471,12 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify' && m.type !== 'append') return;
       for (const msg of m.messages) {
+        // Ignora mensagens antigas de sincronização (mais velhas que 2 minutos)
+        const msgTimestamp = Number(msg.messageTimestamp || 0);
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (m.type === 'append' && msgTimestamp > 0 && (nowSec - msgTimestamp) > 120) {
+          continue;
+        }
         await processIncomingMessage(unitId, unitName, msg.key, msg.message, msg.pushName);
       }
     });
@@ -448,19 +522,14 @@ async function sendHumanizedMessage(unitId, targetJid, messageText) {
     setTimeout(() => recentAiTexts.delete(textKey), 90000);
   }
 
-  // Sincroniza sessões USync do destinatário antes de cifrar para evitar 1 risquinho / Bad MAC
-  try {
-    await sock.assertSessions([targetJid], true);
-  } catch {}
-
-  await sleep(randomBetween(900, 1800));
+  await sleep(randomBetween(900, 1700));
 
   try {
     await sock.presenceSubscribe(targetJid);
     await sock.sendPresenceUpdate('composing', targetJid);
   } catch {}
 
-  const typingTimeMs = Math.min(Math.max(messageText.length * 28, 2200), 5000) + randomBetween(200, 600);
+  const typingTimeMs = Math.min(Math.max(messageText.length * 28, 2200), 4800) + randomBetween(200, 600);
   await sleep(typingTimeMs);
 
   try {
@@ -474,10 +543,6 @@ async function sendHumanizedMessage(unitId, targetJid, messageText) {
   if (sentMsg?.key?.id) {
     setBoundedMap(sentMessagesCache, sentMsg.key.id, messageText, 500);
   }
-
-  setTimeout(() => {
-    try { sock.sendPresenceUpdate('unavailable'); } catch {}
-  }, 5000);
 
   return sentMsg;
 }
@@ -525,7 +590,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.2 (Blindagem Multi-Device + USync Assert + Anti-Echo):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.3 (Suporte Nativo @LID Comercial + Salva-Vidas de Lead):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -610,7 +675,7 @@ app.get('/status', (req, res) => {
     summary[id] = { name: s.name, status: s.status, phone: s.phone };
   }
   res.json({
-    engine: 'native_multifile_v6.2_usync_commercial',
+    engine: 'native_multifile_v6.3_lid_commercial',
     active_sessions: Object.keys(sessions).length,
     webhook_url_configured: WEBHOOK_URL,
     units: summary,
@@ -689,7 +754,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v6.2 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v6.3 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
