@@ -1,6 +1,6 @@
 {
   "name": "mult-whatsapp-gateway",
-  "version": "1.0.0",
+  "version": "7.2.0",
   "description": "Gateway dedicado WhatsApp Baileys para MULT CRM",
   "type": "module",
   "main": "index.js",
@@ -8,7 +8,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.15",
+    "@whiskeysockets/baileys": "latest",
     "express": "^4.19.2",
     "cors": "^2.8.5",
     "qrcode": "^1.5.4",
