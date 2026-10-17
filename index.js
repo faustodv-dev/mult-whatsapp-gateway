@@ -14,7 +14,7 @@ import path from 'path';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '5mb' }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = (process.env.API_KEY || 'multZap2026!secret').trim();
@@ -33,7 +33,8 @@ const sentMessagesCache = new Map();
 const recentAiTexts = new Set();
 const processedMsgIds = new Set();
 const lidToPhoneMap = new Map();
-const externalHumanChats = new Map();
+const phoneToLidMap = new Map();
+const humanActiveContacts = new Map();
 const msgRetryCounterMap = new Map();
 
 let cachedUnits = [];
@@ -48,7 +49,7 @@ const msgRetryCounterCache = {
   get: (key) => msgRetryCounterMap.get(key),
   set: (key, value) => {
     msgRetryCounterMap.set(key, value);
-    if (msgRetryCounterMap.size > 1000) {
+    if (msgRetryCounterMap.size > 1500) {
       const firstKey = msgRetryCounterMap.keys().next().value;
       msgRetryCounterMap.delete(firstKey);
     }
@@ -103,28 +104,52 @@ function registerLidMapping(lidJid, phoneJid) {
   const cleanPhone = String(phoneJid).split('@')[0].split(':')[0].replace(/\D/g, '');
   if (cleanLid.includes('@lid') && cleanPhone.length >= 10) {
     setBoundedMap(lidToPhoneMap, cleanLid, cleanPhone, 1500);
-  }
-}
-
-function markAsExternalHumanChat(phone, remoteJid) {
-  const now = Date.now();
-  if (remoteJid) setBoundedMap(externalHumanChats, String(remoteJid).trim(), now, 1000);
-  if (phone) {
-    for (const v of getPhoneVariants(phone)) {
-      setBoundedMap(externalHumanChats, v, now, 1000);
+    for (const v of getPhoneVariants(cleanPhone)) {
+      setBoundedMap(phoneToLidMap, v, cleanLid, 1500);
     }
   }
 }
 
-function isExternalHumanChat(phone, remoteJid) {
-  const ttlMs = 24 * 60 * 60 * 1000;
+// Cancela qualquer timer de fallback pendente para este contato quando um humano assume ou quando a mensagem abre
+function cancelPendingFallbacksForContact(phone, remoteJid) {
+  for (const [id, entry] of pendingRetryTimers.entries()) {
+    if (
+      (remoteJid && entry.remoteJid === remoteJid) ||
+      (phone && entry.phone === phone)
+    ) {
+      clearTimeout(entry.timer);
+      pendingRetryTimers.delete(id);
+    }
+  }
+}
+
+// Marca imediatamente o contato como em atendimento humano (bloqueia criação de card falso / IA por 24h)
+function markContactAsHumanActive(phone, remoteJid) {
   const now = Date.now();
-  if (remoteJid && externalHumanChats.has(String(remoteJid).trim())) {
-    if (now - externalHumanChats.get(String(remoteJid).trim()) < ttlMs) return true;
+  cancelPendingFallbacksForContact(phone, remoteJid);
+  if (remoteJid) {
+    setBoundedMap(humanActiveContacts, String(remoteJid).trim(), now, 1500);
   }
   if (phone) {
     for (const v of getPhoneVariants(phone)) {
-      if (externalHumanChats.has(v) && (now - externalHumanChats.get(v) < ttlMs)) {
+      setBoundedMap(humanActiveContacts, v, now, 1500);
+      const mappedLid = phoneToLidMap.get(v);
+      if (mappedLid) {
+        setBoundedMap(humanActiveContacts, mappedLid, now, 1500);
+      }
+    }
+  }
+}
+
+function isContactHumanActive(phone, remoteJid) {
+  const ttlMs = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  if (remoteJid && humanActiveContacts.has(String(remoteJid).trim())) {
+    if (now - humanActiveContacts.get(String(remoteJid).trim()) < ttlMs) return true;
+  }
+  if (phone) {
+    for (const v of getPhoneVariants(phone)) {
+      if (humanActiveContacts.has(v) && (now - humanActiveContacts.get(v) < ttlMs)) {
         return true;
       }
     }
@@ -191,15 +216,14 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
 
       if (!res.ok) {
         const errTxt = await res.text();
-        lastBackupResult = `error_http_${res.status}: ${errTxt.slice(0, 100)}`;
+        lastBackupResult = `error_http_${res.status}: ${errTxt.slice(0, 80)}`;
       } else {
         lastBackupResult = `ok (${Object.keys(snapshot).length} files at ${new Date().toISOString()})`;
       }
     } catch (err) {
       lastBackupResult = `exception: ${err.message}`;
-      console.error(`[${unitId}] Erro no backup snapshot:`, err.message);
     }
-  }, 5000);
+  }, 6000);
 }
 
 async function restoreFolderFromSupabase(unitId, authFolder) {
@@ -223,7 +247,6 @@ async function restoreFolderFromSupabase(unitId, authFolder) {
     lastBackupResult = `restored (${Object.keys(snapshot).length} files)`;
     return true;
   } catch (err) {
-    console.error(`[${unitId}] Erro ao restaurar snapshot:`, err.message);
     return false;
   }
 }
@@ -252,9 +275,7 @@ async function fetchUnitsFromSupabase() {
       const data = await res.json();
       if (Array.isArray(data)) cachedUnits = data;
     }
-  } catch (err) {
-    console.error('Erro ao buscar unidades no Supabase:', err.message);
-  }
+  } catch {}
   return cachedUnits;
 }
 
@@ -291,7 +312,7 @@ async function forwardToCrmWebhook({ unitId, unitName, phone, remoteJid, senderN
     const whBody = await whRes.text();
 
     if (fromMe && whBody.includes('ignored_outbound_without_lead')) {
-      markAsExternalHumanChat(phone, remoteJid);
+      markContactAsHumanActive(phone, remoteJid);
     }
 
     logEvent({
@@ -325,7 +346,8 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   const msgId = key?.id;
   if (msgId && processedMsgIds.has(msgId)) return;
 
-  if (!messageObj && key?.fromMe) return;
+  // Se foi enviada pelo WhatsApp da unidade, verifica se é eco da IA ou mensagem manual da equipe (ex: Camilla)
+  const fromMe = Boolean(key.fromMe);
 
   if (msgId && sentMessagesCache.has(msgId)) {
     addBoundedSet(processedMsgIds, msgId, 1000);
@@ -342,22 +364,40 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
     (remoteJid.includes('@lid') ? '' : remoteJid);
 
   const phone = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
-  const fromMe = Boolean(key.fromMe);
   const senderName = pushName || 'Lead WhatsApp';
 
-  if (!fromMe && isExternalHumanChat(phone, remoteJid)) {
-    if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
-    logEvent({ status: 'blocked_reply_to_human_external_chat', phone, remoteJid });
-    return;
+  // SE FOR MENSAGEM MANUAL DA EQUIPE (fromMe: true):
+  // Cancela imediatamente qualquer timer de fallback daquele contato e marca como atendimento humano!
+  if (fromMe) {
+    if (!messageObj) return;
+    const text = extractMessageText(messageObj);
+    const textSignature = String(text || '').trim().slice(0, 50);
+    if (textSignature && recentAiTexts.has(textSignature)) {
+      if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
+      logEvent({ status: 'ignored_ai_outbound_echo_by_text', phone });
+      return;
+    }
+    // É uma atendente humana (ex: Camilla) conversando! Protege esse contato imediatamente:
+    markContactAsHumanActive(phone, remoteJid);
+  }
+
+  // SE FOR RESPOSTA DE UM CONTATO EM ATENDIMENTO HUMANO:
+  // Nunca aciona fallback falso nem cria card novo por engano!
+  if (!fromMe && isContactHumanActive(phone, remoteJid)) {
+    cancelPendingFallbacksForContact(phone, remoteJid);
+    if (!messageObj) {
+      logEvent({ status: 'ignored_retry_on_human_chat', phone, remoteJid });
+      return;
+    }
   }
 
   if (!messageObj) {
     if (!fromMe) {
       logEvent({ status: 'decrypt_retry_waiting', remoteJid, phone, msgId });
-      if (phone && msgId && !pendingRetryTimers.has(msgId)) {
+      if (phone && msgId && !pendingRetryTimers.has(msgId) && !isContactHumanActive(phone, remoteJid)) {
         const timer = setTimeout(async () => {
           pendingRetryTimers.delete(msgId);
-          if (processedMsgIds.has(msgId) || isExternalHumanChat(phone, remoteJid)) return;
+          if (processedMsgIds.has(msgId) || isContactHumanActive(phone, remoteJid)) return;
           addBoundedSet(processedMsgIds, msgId, 1000);
           logEvent({ status: 'lid_safe_fallback_to_crm', phone, remoteJid });
           await forwardToCrmWebhook({
@@ -369,17 +409,18 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
             text: 'Olá! Gostaria de saber mais informações sobre os cursos.',
             fromMe: false
           });
-        }, 5000);
-        pendingRetryTimers.set(msgId, timer);
+        }, 6000);
+        pendingRetryTimers.set(msgId, { timer, phone, remoteJid });
       }
     }
     return;
   }
 
   if (msgId && pendingRetryTimers.has(msgId)) {
-    clearTimeout(pendingRetryTimers.get(msgId));
+    clearTimeout(pendingRetryTimers.get(msgId).timer);
     pendingRetryTimers.delete(msgId);
   }
+  cancelPendingFallbacksForContact(phone, remoteJid);
 
   if (messageObj.protocolMessage || messageObj.senderKeyDistributionMessage || messageObj.reactionMessage) {
     return;
@@ -394,14 +435,13 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
     return;
   }
 
-  const textSignature = text.trim().slice(0, 50);
-  if (fromMe && recentAiTexts.has(textSignature)) {
-    if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
-    logEvent({ status: 'ignored_ai_outbound_echo_by_text', phone });
+  if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
+
+  // Se o contato já foi marcado como conversa humana externa (sem card prévio), não envia ao CRM como novo lead
+  if (!fromMe && isContactHumanActive(phone, remoteJid)) {
+    logEvent({ status: 'blocked_reply_to_human_external_chat', phone, remoteJid, text });
     return;
   }
-
-  if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
 
   await forwardToCrmWebhook({
     unitId,
@@ -451,12 +491,20 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       printQRInTerminal: false,
       logger,
       browser: Browsers.ubuntu('Chrome'),
-      markOnlineOnConnect: false,
+      // CRÍTICO: markOnlineOnConnect: true mantém o canal Signal aberto para receber e enviar pre-keys sem "Aguardando mensagem"!
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+      fireInitQueries: true,
       generateHighQualityLinkPreview: false,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 20000,
       msgRetryCounterCache,
+      // CRÍTICO: Quando o celular do lead pede reenvio de pacote ("Aguardando mensagem"), devolve o proto exato!
       getMessage: async (key) => {
         const cachedText = sentMessagesCache.get(key.id);
         if (cachedText) {
+          logEvent({ status: 'signal_retry_fulfilled_to_lead', msgId: key.id, remoteJid: key.remoteJid });
           return { conversation: cachedText };
         }
         return undefined;
@@ -482,10 +530,17 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       }
     });
 
-    sock.ev.on('messaging-history.set', ({ contacts }) => {
+    sock.ev.on('messaging-history.set', ({ contacts, messages }) => {
       if (Array.isArray(contacts)) {
         for (const c of contacts) {
           if (c.lid && c.id) registerLidMapping(c.lid, c.id);
+        }
+      }
+      if (Array.isArray(messages)) {
+        for (const m of messages) {
+          if (m?.key?.fromMe && m?.key?.remoteJid) {
+            markContactAsHumanActive(m.key?.senderPn || m.key?.participantPn, m.key.remoteJid);
+          }
         }
       }
       scheduleFolderBackupToSupabase(unitId, authFolder);
@@ -512,7 +567,7 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
           await deleteSnapshotFromSupabase(unitId);
           delete sessions[unitId];
         } else {
-          const retryMs = randomBetween(4000, 8000);
+          const retryMs = randomBetween(3000, 6000);
           setTimeout(() => startUnitWhatsApp(unitId, unitName), retryMs);
         }
       } else if (connection === 'open') {
@@ -532,7 +587,7 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         const nowSec = Math.floor(Date.now() / 1000);
         if (msgTimestamp > 0 && (nowSec - msgTimestamp) > 60) {
           if (msg.key?.fromMe) {
-            markAsExternalHumanChat(msg.key?.senderPn, msg.key?.remoteJid);
+            markContactAsHumanActive(msg.key?.senderPn, msg.key?.remoteJid);
           }
           continue;
         }
@@ -568,7 +623,8 @@ async function restoreAllSessionsOnBoot() {
   }
 }
 
-async function sendHumanizedMessage(unitId, targetJid, messageText) {
+// ENVIO COM ASSERT SESSIONS + SUPORTE HÍBRIDO (@LID E @S.WHATSAPP.NET) PARA ELIMINAR "AGUARDANDO MENSAGEM"
+async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
   const session = sessions[unitId];
   if (!session || session.status !== 'connected' || !session.sock) {
     throw new Error('Sessão da unidade desconectada.');
@@ -581,32 +637,41 @@ async function sendHumanizedMessage(unitId, targetJid, messageText) {
     setTimeout(() => recentAiTexts.delete(textKey), 90000);
   }
 
-  await sleep(randomBetween(900, 1700));
-
+  // 1. Força o Baileys a buscar/validar as chaves públicas (PreKeyBundle) do destinatário antes de cifrar!
+  const jidsToAssert = [targetJid];
+  if (mappedLid && mappedLid !== targetJid) {
+    jidsToAssert.push(mappedLid);
+  }
   try {
-    await sock.presenceSubscribe(targetJid);
-    await sock.sendPresenceUpdate('composing', targetJid);
+    await sock.assertSessions(jidsToAssert, true);
   } catch {}
 
-  const typingTimeMs = Math.min(Math.max(messageText.length * 28, 2200), 4800) + randomBetween(200, 600);
+  await sleep(randomBetween(700, 1300));
+
+  const activeChatJid = mappedLid || targetJid;
+
+  try {
+    await sock.presenceSubscribe(activeChatJid);
+    await sock.sendPresenceUpdate('composing', activeChatJid);
+  } catch {}
+
+  const typingTimeMs = Math.min(Math.max(messageText.length * 24, 1800), 4000) + randomBetween(200, 500);
   await sleep(typingTimeMs);
 
   try {
-    await sock.sendPresenceUpdate('paused', targetJid);
+    await sock.sendPresenceUpdate('paused', activeChatJid);
   } catch {}
 
-  await sleep(randomBetween(250, 500));
+  await sleep(randomBetween(200, 400));
 
+  // 2. Envia a mensagem para o JID verificado após o assertSessions
   const sentMsg = await sock.sendMessage(targetJid, { text: messageText });
 
   if (sentMsg?.key?.id) {
-    setBoundedMap(sentMessagesCache, sentMsg.key.id, messageText, 300);
+    setBoundedMap(sentMessagesCache, sentMsg.key.id, messageText, 500);
   }
 
-  setTimeout(() => {
-    try { sock.sendPresenceUpdate('unavailable'); } catch {}
-  }, 5000);
-
+  // NÃO envia presenceUpdate('unavailable') para não cortar o canal de retry receipts do celular do lead!
   return sentMsg;
 }
 
@@ -653,7 +718,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.9.1 (Bootstrap Nativo Signal + Persistência Cloud Corrigida):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v7.0 (AssertSessions E2E + Anti-Invasão Humana Imediata):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -745,7 +810,7 @@ app.get('/status', (req, res) => {
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v6.9.1_bootstrap_fixed',
+    engine: 'native_multifile_v7.0_assert_sessions',
     memory_rss_mb: `${memMb} MB`,
     last_cloud_backup: lastBackupResult,
     active_sessions: Object.keys(sessions).length,
@@ -760,7 +825,7 @@ app.post('/send', async (req, res) => {
   if (token !== API_KEY) return res.status(401).json({ error: 'Não autorizado' });
 
   try {
-    const { phone, message, unitId } = req.body;
+    const { phone, remoteJid, message, unitId } = req.body;
 
     let targetUnitId = unitId && sessions[unitId]?.status === 'connected' ? unitId : null;
     if (!targetUnitId) {
@@ -787,8 +852,18 @@ app.post('/send', async (req, res) => {
       if (!sock) return;
 
       const candidates = getPhoneVariants(cleanPhone);
-      let targetJid = `${cleanPhone}@s.whatsapp.net`;
 
+      let mappedLid = remoteJid && String(remoteJid).includes('@lid') ? String(remoteJid).trim() : null;
+      if (!mappedLid) {
+        for (const num of candidates) {
+          if (phoneToLidMap.has(num)) {
+            mappedLid = phoneToLidMap.get(num);
+            break;
+          }
+        }
+      }
+
+      let targetJid = `${cleanPhone}@s.whatsapp.net`;
       for (const num of candidates) {
         try {
           const [result] = await sock.onWhatsApp(num);
@@ -799,11 +874,12 @@ app.post('/send', async (req, res) => {
         } catch {}
       }
 
-      const sent = await sendHumanizedMessage(targetUnitId, targetJid, message);
+      const sent = await sendHumanizedMessage(targetUnitId, targetJid, mappedLid, message);
       logEvent({
         status: 'outbound_sent_ok',
         unitId: targetUnitId,
         targetJid,
+        mappedLid: mappedLid || null,
         msgId: sent?.key?.id || null
       });
       return sent;
@@ -821,7 +897,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v6.9.1 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v7.0 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
