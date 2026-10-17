@@ -26,13 +26,13 @@ const SUPABASE_KEY = (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_R
 const sessions = {};
 const sendQueues = {};
 const backupTimers = {};
+const pendingRetryTimers = new Map();
 
-// Estruturas enxutas com limite rígido de memória RAM
 const sentMessagesCache = new Map();
 const recentAiTexts = new Set();
 const processedMsgIds = new Set();
 const lidToPhoneMap = new Map();
-const externalHumanChats = new Map(); // Contatos chamados pela equipe que não estão no CRM
+const externalHumanChats = new Map();
 const msgRetryCounterMap = new Map();
 
 let cachedUnits = [];
@@ -115,7 +115,7 @@ function markAsExternalHumanChat(phone, remoteJid) {
 }
 
 function isExternalHumanChat(phone, remoteJid) {
-  const ttlMs = 24 * 60 * 60 * 1000; // Protege a conversa humana por 24h
+  const ttlMs = 24 * 60 * 60 * 1000;
   const now = Date.now();
   if (remoteJid && externalHumanChats.has(String(remoteJid).trim())) {
     if (now - externalHumanChats.get(String(remoteJid).trim()) < ttlMs) return true;
@@ -152,7 +152,8 @@ function extractMessageText(messageObj) {
   );
 }
 
-// BACKUP ULTRA-LEVE: Salva apenas creds.json e chaves mestre (menos de 50KB na RAM)
+// Preserva creds.json, pre-key-* e app-state-sync-key-* (necessários para descriptografar mensagens!)
+// Ignora apenas session-* e sender-key-* para manter RAM baixa e evitar Bad MAC
 async function scheduleFolderBackupToSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return;
   if (backupTimers[unitId]) clearTimeout(backupTimers[unitId]);
@@ -163,8 +164,7 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
       const files = fs.readdirSync(authFolder);
       const snapshot = {};
       for (const file of files) {
-        // Ignora arquivos voláteis por contato para não pesar memória RAM nem restaurar Bad MAC
-        if (file.startsWith('session-') || file.startsWith('sender-key-') || file.startsWith('pre-key-')) {
+        if (file.startsWith('session-') || file.startsWith('sender-key-')) {
           continue;
         }
         const fullPath = path.join(authFolder, file);
@@ -194,7 +194,7 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
     } catch (err) {
       console.error(`[${unitId}] Erro no backup leve:`, err.message);
     }
-  }, 10000);
+  }, 8000);
 }
 
 async function restoreFolderFromSupabase(unitId, authFolder) {
@@ -285,8 +285,6 @@ async function forwardToCrmWebhook({ unitId, unitName, phone, remoteJid, senderN
     });
     const whBody = await whRes.text();
 
-    // Se a consultora enviou mensagem manual (fromMe: true) e o CRM respondeu que NÃO existe lead para esse número,
-    // marcamos como conversa humana externa (ex: aluno já matriculado) para que a resposta dele não crie card nem acione a IA!
     if (fromMe && whBody.includes('ignored_outbound_without_lead')) {
       markAsExternalHumanChat(phone, remoteJid);
     }
@@ -342,12 +340,44 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   const fromMe = Boolean(key.fromMe);
   const senderName = pushName || 'Lead WhatsApp';
 
-  // Se o Baileys pediu retry de descriptografia, aguarda o evento nativo messages.update sem inventar texto falso
+  // BLOQUEIO ANTI-INVASÃO ANTES DE QUALQUER RETRY OU FALLBACK:
+  // Se a equipe (ex: Camilla) já iniciou conversa com esse número fora do CRM, ignora imediatamente!
+  if (!fromMe && isExternalHumanChat(phone, remoteJid)) {
+    if (msgId) addBoundedSet(processedMsgIds, msgId, 800);
+    logEvent({ status: 'blocked_reply_to_human_external_chat', phone, remoteJid });
+    return;
+  }
+
+  // Se o WhatsApp Comercial entregou pacote @lid aguardando retry de chave:
+  // Aguarda 4.5s pelo texto real; se a Meta segurar o texto, usa o senderPn para não perder o lead novo!
   if (!messageObj) {
     if (!fromMe) {
       logEvent({ status: 'decrypt_retry_waiting', remoteJid, phone, msgId });
+      if (phone && msgId && !pendingRetryTimers.has(msgId)) {
+        const timer = setTimeout(async () => {
+          pendingRetryTimers.delete(msgId);
+          if (processedMsgIds.has(msgId) || isExternalHumanChat(phone, remoteJid)) return;
+          addBoundedSet(processedMsgIds, msgId, 800);
+          logEvent({ status: 'lid_safe_fallback_to_crm', phone, remoteJid });
+          await forwardToCrmWebhook({
+            unitId,
+            unitName,
+            phone,
+            remoteJid,
+            senderName,
+            text: 'Olá! Gostaria de saber mais informações sobre os cursos.',
+            fromMe: false
+          });
+        }, 4500);
+        pendingRetryTimers.set(msgId, timer);
+      }
     }
     return;
+  }
+
+  if (msgId && pendingRetryTimers.has(msgId)) {
+    clearTimeout(pendingRetryTimers.get(msgId));
+    pendingRetryTimers.delete(msgId);
   }
 
   if (messageObj.protocolMessage || messageObj.senderKeyDistributionMessage || messageObj.reactionMessage) {
@@ -371,18 +401,6 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   }
 
   if (msgId) addBoundedSet(processedMsgIds, msgId, 800);
-
-  // BLOQUEIO IMEDIATO NA MEMÓRIA: Se for resposta de um aluno/contato que a consultora chamou primeiro (fora do CRM),
-  // ignora antes de chamar a Vercel para nunca disparar boas-vindas da IA no meio da conversa!
-  if (!fromMe && isExternalHumanChat(phone, remoteJid)) {
-    logEvent({
-      status: 'blocked_reply_to_human_external_chat',
-      phone,
-      remoteJid,
-      text
-    });
-    return;
-  }
 
   await forwardToCrmWebhook({
     unitId,
@@ -425,11 +443,11 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
 
     const sock = makeWASocket({
       version,
-      auth: state, // Leitura direta de disco: menor uso de RAM e zero conflito de cache Signal
+      auth: state,
       printQRInTerminal: false,
       logger,
       browser: Browsers.ubuntu('Chrome'),
-      markOnlineOnConnect: false,
+      markOnlineOnConnect: true, // Obrigatório para receber os pacotes de retry do @lid
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
       fireInitQueries: true,
@@ -506,6 +524,9 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         const msgTimestamp = Number(msg.messageTimestamp || 0);
         const nowSec = Math.floor(Date.now() / 1000);
         if (m.type === 'append' && msgTimestamp > 0 && (nowSec - msgTimestamp) > 90) {
+          if (msg.key?.fromMe) {
+            markAsExternalHumanChat(msg.key?.senderPn, msg.key?.remoteJid);
+          }
           continue;
         }
         await processIncomingMessage(unitId, unitName, msg.key, msg.message, msg.pushName);
@@ -621,7 +642,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.6 Ultra-Light (Anti-Invasão Humana + Baixa RAM + @s.whatsapp.net):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.7 (Pre-Keys Preservadas + Anti-Invasão + Entrega @s.whatsapp.net):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -707,7 +728,7 @@ app.get('/status', (req, res) => {
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v6.6_ultralight',
+    engine: 'native_multifile_v6.7_prekeys_safe_fallback',
     memory_rss_mb: `${memMb} MB`,
     active_sessions: Object.keys(sessions).length,
     webhook_url_configured: WEBHOOK_URL,
@@ -749,7 +770,6 @@ app.post('/send', async (req, res) => {
 
       const candidates = getPhoneVariants(cleanPhone);
 
-      // Envia sempre para o JID clássico @s.whatsapp.net resolvido pelo onWhatsApp (2 risquinhos garantidos)
       let targetJid = `${cleanPhone}@s.whatsapp.net`;
 
       for (const num of candidates) {
@@ -785,7 +805,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v6.6 Ultra-Light MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v6.7 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
