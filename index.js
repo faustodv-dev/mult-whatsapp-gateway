@@ -1,7 +1,6 @@
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
   Browsers,
   makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
@@ -29,7 +28,8 @@ const sendQueues = {};
 const backupTimers = {};
 const pendingRetryTimers = new Map();
 
-const sentMessagesCache = new Map();
+// Guarda o objeto Protobuf REAL (msg.message) para que o retry do celular do lead nunca falhe por Hash Mismatch!
+const sentProtoMessagesCache = new Map();
 const recentAiTexts = new Set();
 const processedMsgIds = new Set();
 const lidToPhoneMap = new Map();
@@ -110,7 +110,6 @@ function registerLidMapping(lidJid, phoneJid) {
   }
 }
 
-// Cancela qualquer timer de fallback pendente para este contato quando um humano assume ou quando a mensagem abre
 function cancelPendingFallbacksForContact(phone, remoteJid) {
   for (const [id, entry] of pendingRetryTimers.entries()) {
     if (
@@ -123,7 +122,6 @@ function cancelPendingFallbacksForContact(phone, remoteJid) {
   }
 }
 
-// Marca imediatamente o contato como em atendimento humano (bloqueia criação de card falso / IA por 24h)
 function markContactAsHumanActive(phone, remoteJid) {
   const now = Date.now();
   cancelPendingFallbacksForContact(phone, remoteJid);
@@ -336,6 +334,13 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
     return;
   }
 
+  const msgId = key?.id;
+
+  // Salva o Protobuf exato de toda mensagem de saída no milissegundo zero para responder a qualquer Retry Receipt imediatamente!
+  if (key?.fromMe && msgId && messageObj) {
+    setBoundedMap(sentProtoMessagesCache, msgId, messageObj, 800);
+  }
+
   if (key.senderPn && remoteJid.includes('@lid')) {
     registerLidMapping(remoteJid, key.senderPn);
   }
@@ -343,17 +348,9 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
     registerLidMapping(remoteJid, key.remoteJidAlt);
   }
 
-  const msgId = key?.id;
   if (msgId && processedMsgIds.has(msgId)) return;
 
-  // Se foi enviada pelo WhatsApp da unidade, verifica se é eco da IA ou mensagem manual da equipe (ex: Camilla)
   const fromMe = Boolean(key.fromMe);
-
-  if (msgId && sentMessagesCache.has(msgId)) {
-    addBoundedSet(processedMsgIds, msgId, 1000);
-    logEvent({ status: 'ignored_ai_outbound_echo_by_id', msgId });
-    return;
-  }
 
   const mappedPhone = lidToPhoneMap.get(remoteJid) || '';
   const rawPhone =
@@ -366,23 +363,18 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   const phone = String(rawPhone).split('@')[0].split(':')[0].replace(/\D/g, '');
   const senderName = pushName || 'Lead WhatsApp';
 
-  // SE FOR MENSAGEM MANUAL DA EQUIPE (fromMe: true):
-  // Cancela imediatamente qualquer timer de fallback daquele contato e marca como atendimento humano!
   if (fromMe) {
     if (!messageObj) return;
     const text = extractMessageText(messageObj);
     const textSignature = String(text || '').trim().slice(0, 50);
     if (textSignature && recentAiTexts.has(textSignature)) {
       if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
-      logEvent({ status: 'ignored_ai_outbound_echo_by_text', phone });
+      logEvent({ status: 'ignored_ai_outbound_echo_by_text', msgId, phone });
       return;
     }
-    // É uma atendente humana (ex: Camilla) conversando! Protege esse contato imediatamente:
     markContactAsHumanActive(phone, remoteJid);
   }
 
-  // SE FOR RESPOSTA DE UM CONTATO EM ATENDIMENTO HUMANO:
-  // Nunca aciona fallback falso nem cria card novo por engano!
   if (!fromMe && isContactHumanActive(phone, remoteJid)) {
     cancelPendingFallbacksForContact(phone, remoteJid);
     if (!messageObj) {
@@ -437,7 +429,6 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
 
   if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
 
-  // Se o contato já foi marcado como conversa humana externa (sem card prévio), não envia ao CRM como novo lead
   if (!fromMe && isContactHumanActive(phone, remoteJid)) {
     logEvent({ status: 'blocked_reply_to_human_external_chat', phone, remoteJid, text });
     return;
@@ -480,18 +471,15 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
-    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
-      version,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
       printQRInTerminal: false,
       logger,
-      browser: Browsers.ubuntu('Chrome'),
-      // CRÍTICO: markOnlineOnConnect: true mantém o canal Signal aberto para receber e enviar pre-keys sem "Aguardando mensagem"!
+      browser: Browsers.macOS('Desktop'),
       markOnlineOnConnect: true,
       syncFullHistory: false,
       fireInitQueries: true,
@@ -500,12 +488,34 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 20000,
       msgRetryCounterCache,
-      // CRÍTICO: Quando o celular do lead pede reenvio de pacote ("Aguardando mensagem"), devolve o proto exato!
+      // Hook oficial do Baileys para empacotar a estrutura Protobuf compatível com todo dispositivo Multi-Device / LID
+      patchMessageBeforeSending: (message) => {
+        const requiresPatch = !!(
+          message.buttonsMessage ||
+          message.templateMessage ||
+          message.listMessage
+        );
+        if (requiresPatch) {
+          message = {
+            viewOnceMessage: {
+              message: {
+                messageContextInfo: {
+                  deviceListMetadataVersion: 2,
+                  deviceListMetadata: {}
+                },
+                ...message
+              }
+            }
+          };
+        }
+        return message;
+      },
+      // Devolve o objeto Protobuf REAL (extendedTextMessage / conversation) salvo antes do retry!
       getMessage: async (key) => {
-        const cachedText = sentMessagesCache.get(key.id);
-        if (cachedText) {
-          logEvent({ status: 'signal_retry_fulfilled_to_lead', msgId: key.id, remoteJid: key.remoteJid });
-          return { conversation: cachedText };
+        const protoMsg = sentProtoMessagesCache.get(key.id);
+        if (protoMsg) {
+          logEvent({ status: 'signal_retry_fulfilled_exact_proto', msgId: key.id, remoteJid: key.remoteJid });
+          return protoMsg;
         }
         return undefined;
       }
@@ -581,6 +591,15 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     });
 
     sock.ev.on('messages.upsert', async (m) => {
+      // Mesmo se não for notify/append, se for mensagem nossa de saída, guarda o Protobuf imediatamente!
+      if (Array.isArray(m.messages)) {
+        for (const msg of m.messages) {
+          if (msg?.key?.fromMe && msg?.key?.id && msg?.message) {
+            setBoundedMap(sentProtoMessagesCache, msg.key.id, msg.message, 800);
+          }
+        }
+      }
+
       if (m.type !== 'notify' && m.type !== 'append') return;
       for (const msg of m.messages) {
         const msgTimestamp = Number(msg.messageTimestamp || 0);
@@ -623,7 +642,6 @@ async function restoreAllSessionsOnBoot() {
   }
 }
 
-// ENVIO COM ASSERT SESSIONS + SUPORTE HÍBRIDO (@LID E @S.WHATSAPP.NET) PARA ELIMINAR "AGUARDANDO MENSAGEM"
 async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
   const session = sessions[unitId];
   if (!session || session.status !== 'connected' || !session.sock) {
@@ -637,16 +655,7 @@ async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
     setTimeout(() => recentAiTexts.delete(textKey), 90000);
   }
 
-  // 1. Força o Baileys a buscar/validar as chaves públicas (PreKeyBundle) do destinatário antes de cifrar!
-  const jidsToAssert = [targetJid];
-  if (mappedLid && mappedLid !== targetJid) {
-    jidsToAssert.push(mappedLid);
-  }
-  try {
-    await sock.assertSessions(jidsToAssert, true);
-  } catch {}
-
-  await sleep(randomBetween(700, 1300));
+  await sleep(randomBetween(700, 1200));
 
   const activeChatJid = mappedLid || targetJid;
 
@@ -655,7 +664,7 @@ async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
     await sock.sendPresenceUpdate('composing', activeChatJid);
   } catch {}
 
-  const typingTimeMs = Math.min(Math.max(messageText.length * 24, 1800), 4000) + randomBetween(200, 500);
+  const typingTimeMs = Math.min(Math.max(messageText.length * 24, 1800), 3800) + randomBetween(200, 500);
   await sleep(typingTimeMs);
 
   try {
@@ -664,14 +673,15 @@ async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
 
   await sleep(randomBetween(200, 400));
 
-  // 2. Envia a mensagem para o JID verificado após o assertSessions
+  // IMPORTANTE: NÃO chamar assertSessions(_, true) com force=true pois no WhatsApp Business com @lid
+  // o force=true recria uma sessão @s.whatsapp.net paralela que colide com a sessão @lid do aparelho!
   const sentMsg = await sock.sendMessage(targetJid, { text: messageText });
 
-  if (sentMsg?.key?.id) {
-    setBoundedMap(sentMessagesCache, sentMsg.key.id, messageText, 500);
+  if (sentMsg?.key?.id && sentMsg?.message) {
+    setBoundedMap(sentProtoMessagesCache, sentMsg.key.id, sentMsg.message, 800);
+    addBoundedSet(processedMsgIds, sentMsg.key.id, 1000);
   }
 
-  // NÃO envia presenceUpdate('unavailable') para não cortar o canal de retry receipts do celular do lead!
   return sentMsg;
 }
 
@@ -718,7 +728,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v7.0 (AssertSessions E2E + Anti-Invasão Humana Imediata):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v7.1 (Exact Protobuf Retry + Native Baileys Version):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -810,7 +820,7 @@ app.get('/status', (req, res) => {
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v7.0_assert_sessions',
+    engine: 'native_multifile_v7.1_exact_proto_retry',
     memory_rss_mb: `${memMb} MB`,
     last_cloud_backup: lastBackupResult,
     active_sessions: Object.keys(sessions).length,
@@ -897,7 +907,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v7.0 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v7.1 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
