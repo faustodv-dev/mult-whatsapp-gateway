@@ -154,7 +154,6 @@ function extractMessageText(messageObj) {
   );
 }
 
-// Backup corrigido com ?on_conflict=id para NUNCA falhar no Supabase e evitar queda a cada deploy!
 async function scheduleFolderBackupToSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return;
   if (backupTimers[unitId]) clearTimeout(backupTimers[unitId]);
@@ -190,9 +189,12 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
         ])
       });
 
-      lastBackupResult = res.ok
-        ? `ok (${Object.keys(snapshot).length} files at ${new Date().toISOString()})`
-        : `error_http_${res.status}`;
+      if (!res.ok) {
+        const errTxt = await res.text();
+        lastBackupResult = `error_http_${res.status}: ${errTxt.slice(0, 100)}`;
+      } else {
+        lastBackupResult = `ok (${Object.keys(snapshot).length} files at ${new Date().toISOString()})`;
+      }
     } catch (err) {
       lastBackupResult = `exception: ${err.message}`;
       console.error(`[${unitId}] Erro no backup snapshot:`, err.message);
@@ -440,7 +442,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
     const { version } = await fetchLatestBaileysVersion();
 
-    // CONFIGURAÇÃO EXATA QUE FUNCIONOU NA ENTREGA DE BOAS-VINDAS (SEM BLOQUEAR O BOOTSTRAP DE CHAVES LID!)
     const sock = makeWASocket({
       version,
       auth: {
@@ -487,7 +488,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
           if (c.lid && c.id) registerLidMapping(c.lid, c.id);
         }
       }
-      // Salva as chaves recebidas durante o bootstrap inicial no Supabase
       scheduleFolderBackupToSupabase(unitId, authFolder);
     });
 
@@ -528,7 +528,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify' && m.type !== 'append') return;
       for (const msg of m.messages) {
-        // Ignora mensagens históricas com mais de 60 segundos para não processar conversas antigas no bootstrap
         const msgTimestamp = Number(msg.messageTimestamp || 0);
         const nowSec = Math.floor(Date.now() / 1000);
         if (msgTimestamp > 0 && (nowSec - msgTimestamp) > 60) {
@@ -564,7 +563,7 @@ async function restoreAllSessionsOnBoot() {
       startUnitWhatsApp(unit.id, unit.name);
       await sleep(1500);
     } else if (unit.whatsapp_status === 'connected') {
-      await updateUnitInSupabase(unitId, 'disconnected', null);
+      await updateUnitInSupabase(unit.id, 'disconnected', null);
     }
   }
 }
@@ -654,7 +653,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.9 (Bootstrap Nativo Signal + Persistência Cloud Corrigida):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.9.1 (Bootstrap Nativo Signal + Persistência Cloud Corrigida):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -746,7 +745,7 @@ app.get('/status', (req, res) => {
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v6.9_bootstrap_fixed',
+    engine: 'native_multifile_v6.9.1_bootstrap_fixed',
     memory_rss_mb: `${memMb} MB`,
     last_cloud_backup: lastBackupResult,
     active_sessions: Object.keys(sessions).length,
@@ -822,7 +821,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v6.9 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v6.9.1 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
