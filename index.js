@@ -1,6 +1,7 @@
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
+  fetchLatestBaileysVersion,
   Browsers,
   makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
@@ -13,7 +14,7 @@ import path from 'path';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = (process.env.API_KEY || 'multZap2026!secret').trim();
@@ -28,7 +29,7 @@ const sendQueues = {};
 const backupTimers = {};
 const pendingRetryTimers = new Map();
 
-// Guarda o objeto Protobuf REAL (msg.message) para que o retry do celular do lead nunca falhe por Hash Mismatch!
+// Guarda o objeto Protobuf REAL (msg.message) para responder aos Retry Receipts sem erro de hash
 const sentProtoMessagesCache = new Map();
 const recentAiTexts = new Set();
 const processedMsgIds = new Set();
@@ -103,9 +104,9 @@ function registerLidMapping(lidJid, phoneJid) {
   const cleanLid = String(lidJid).trim();
   const cleanPhone = String(phoneJid).split('@')[0].split(':')[0].replace(/\D/g, '');
   if (cleanLid.includes('@lid') && cleanPhone.length >= 10) {
-    setBoundedMap(lidToPhoneMap, cleanLid, cleanPhone, 1500);
+    setBoundedMap(lidToPhoneMap, cleanLid, cleanPhone, 2000);
     for (const v of getPhoneVariants(cleanPhone)) {
-      setBoundedMap(phoneToLidMap, v, cleanLid, 1500);
+      setBoundedMap(phoneToLidMap, v, cleanLid, 2000);
     }
   }
 }
@@ -126,14 +127,14 @@ function markContactAsHumanActive(phone, remoteJid) {
   const now = Date.now();
   cancelPendingFallbacksForContact(phone, remoteJid);
   if (remoteJid) {
-    setBoundedMap(humanActiveContacts, String(remoteJid).trim(), now, 1500);
+    setBoundedMap(humanActiveContacts, String(remoteJid).trim(), now, 2000);
   }
   if (phone) {
     for (const v of getPhoneVariants(phone)) {
-      setBoundedMap(humanActiveContacts, v, now, 1500);
+      setBoundedMap(humanActiveContacts, v, now, 2000);
       const mappedLid = phoneToLidMap.get(v);
       if (mappedLid) {
-        setBoundedMap(humanActiveContacts, mappedLid, now, 1500);
+        setBoundedMap(humanActiveContacts, mappedLid, now, 2000);
       }
     }
   }
@@ -177,6 +178,7 @@ function extractMessageText(messageObj) {
   );
 }
 
+// Debounce de 10s para aguardar o fim da rajada do syncFullHistory antes de enviar o snapshot ao Supabase
 async function scheduleFolderBackupToSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return;
   if (backupTimers[unitId]) clearTimeout(backupTimers[unitId]);
@@ -221,7 +223,7 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
     } catch (err) {
       lastBackupResult = `exception: ${err.message}`;
     }
-  }, 6000);
+  }, 10000);
 }
 
 async function restoreFolderFromSupabase(unitId, authFolder) {
@@ -336,7 +338,6 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
 
   const msgId = key?.id;
 
-  // Salva o Protobuf exato de toda mensagem de saída no milissegundo zero para responder a qualquer Retry Receipt imediatamente!
   if (key?.fromMe && msgId && messageObj) {
     setBoundedMap(sentProtoMessagesCache, msgId, messageObj, 800);
   }
@@ -401,7 +402,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
             text: 'Olá! Gostaria de saber mais informações sobre os cursos.',
             fromMe: false
           });
-        }, 6000);
+        }, 6500);
         pendingRetryTimers.set(msgId, { timer, phone, remoteJid });
       }
     }
@@ -471,24 +472,32 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
+      version,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
       printQRInTerminal: false,
       logger,
-      browser: Browsers.macOS('Desktop'),
+      // Desktop / syncFullHistory: true obriga o aparelho principal Business a transferir as chaves mestras de LID e app-state!
+      browser: Browsers.ubuntu('Desktop'),
       markOnlineOnConnect: true,
-      syncFullHistory: false,
+      syncFullHistory: true,
+      // Filtra apenas pacotes essenciais de bootstrap/configuração/recentes (syncType 0, 1, 2, 3), barrando histórico antigo pesado para proteger a RAM
+      shouldSyncHistoryMessage: (msg) => {
+        const sType = msg?.syncType;
+        if (sType === undefined || sType === null) return true;
+        return sType === 0 || sType === 1 || sType === 2 || sType === 3;
+      },
       fireInitQueries: true,
       generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 20000,
       msgRetryCounterCache,
-      // Hook oficial do Baileys para empacotar a estrutura Protobuf compatível com todo dispositivo Multi-Device / LID
       patchMessageBeforeSending: (message) => {
         const requiresPatch = !!(
           message.buttonsMessage ||
@@ -510,7 +519,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         }
         return message;
       },
-      // Devolve o objeto Protobuf REAL (extendedTextMessage / conversation) salvo antes do retry!
       getMessage: async (key) => {
         const protoMsg = sentProtoMessagesCache.get(key.id);
         if (protoMsg) {
@@ -540,10 +548,15 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       }
     });
 
+    // Extrai os mapeamentos LID e conversas humanas do Bootstrap sem reter mensagens antigas na memória RAM
     sock.ev.on('messaging-history.set', ({ contacts, messages }) => {
+      let mappedCount = 0;
       if (Array.isArray(contacts)) {
         for (const c of contacts) {
-          if (c.lid && c.id) registerLidMapping(c.lid, c.id);
+          if (c.lid && c.id) {
+            registerLidMapping(c.lid, c.id);
+            mappedCount++;
+          }
         }
       }
       if (Array.isArray(messages)) {
@@ -553,6 +566,11 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
           }
         }
       }
+      logEvent({
+        status: 'history_bootstrap_synced',
+        contactsMapped: mappedCount,
+        historyMessagesInspected: Array.isArray(messages) ? messages.length : 0
+      });
       scheduleFolderBackupToSupabase(unitId, authFolder);
     });
 
@@ -591,7 +609,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     });
 
     sock.ev.on('messages.upsert', async (m) => {
-      // Mesmo se não for notify/append, se for mensagem nossa de saída, guarda o Protobuf imediatamente!
       if (Array.isArray(m.messages)) {
         for (const msg of m.messages) {
           if (msg?.key?.fromMe && msg?.key?.id && msg?.message) {
@@ -657,6 +674,7 @@ async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
 
   await sleep(randomBetween(700, 1200));
 
+  // Quando a conversa entrou via @lid (mappedLid presente), responde pelo mesmo canal ou pelo JID validado com chaves sincronizadas pelo Bootstrap
   const activeChatJid = mappedLid || targetJid;
 
   try {
@@ -673,8 +691,6 @@ async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
 
   await sleep(randomBetween(200, 400));
 
-  // IMPORTANTE: NÃO chamar assertSessions(_, true) com force=true pois no WhatsApp Business com @lid
-  // o force=true recria uma sessão @s.whatsapp.net paralela que colide com a sessão @lid do aparelho!
   const sentMsg = await sock.sendMessage(targetJid, { text: messageText });
 
   if (sentMsg?.key?.id && sentMsg?.message) {
@@ -728,7 +744,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v7.1 (Exact Protobuf Retry + Native Baileys Version):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v7.2 (SyncFullHistory + Bootstrap de Chaves Mestras LID):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -758,7 +774,7 @@ app.get('/connect/:unitId', async (req, res) => {
         <p style="font-size:18px;">Aparelho ativo: <strong>${displayPhone}</strong></p>
         <form method="POST" action="/logout/${unit.id}" style="margin-top:30px;">
           <button type="submit" style="padding:10px 20px;background:#ef4444;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold;">
-            🔌 Desconectar e Limpar Sessão
+            🔌 Desconectar e Limpar Sessão (Resetar Chaves)
           </button>
         </form>
       </div>
@@ -783,7 +799,12 @@ app.get('/connect/:unitId', async (req, res) => {
   return res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h2>⏳ Preparando conexão para ${unit.name}...</h2>
-      <script>setTimeout(() => location.reload(), 3500);</script>
+      <form method="POST" action="/logout/${unit.id}" style="margin-top:25px;">
+        <button type="submit" style="padding:8px 16px;background:#475569;color:#fff;border:none;border-radius:6px;cursor:pointer;">
+          Forçar Limpeza de Sessão Antiga e Gerar Novo QR
+        </button>
+      </form>
+      <script>setTimeout(() => location.reload(), 4000);</script>
     </div>
   `);
 });
@@ -795,16 +816,15 @@ app.post('/logout/:unitId', async (req, res) => {
     if (s?.sock) {
       try { s.sock.end(undefined); } catch {}
     }
-    if (s?.authFolder) {
-      try { fs.rmSync(s.authFolder, { recursive: true, force: true }); } catch {}
-    }
+    const folder = s?.authFolder || `./auth_info_${unitId}`;
+    try { fs.rmSync(folder, { recursive: true, force: true }); } catch {}
     await deleteSnapshotFromSupabase(unitId);
     delete sessions[unitId];
     await updateUnitInSupabase(unitId, 'disconnected', null);
   } catch (err) {
     console.error('Erro no logout seguro:', err.message);
   }
-  res.redirect('/');
+  res.redirect(`/connect/${unitId}`);
 });
 
 app.get('/status', (req, res) => {
@@ -820,8 +840,9 @@ app.get('/status', (req, res) => {
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v7.1_exact_proto_retry',
+    engine: 'native_multifile_v7.2_sync_full_bootstrap',
     memory_rss_mb: `${memMb} MB`,
+    lid_mappings_in_memory: lidToPhoneMap.size,
     last_cloud_backup: lastBackupResult,
     active_sessions: Object.keys(sessions).length,
     webhook_url_configured: WEBHOOK_URL,
@@ -907,7 +928,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v7.1 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v7.2 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
