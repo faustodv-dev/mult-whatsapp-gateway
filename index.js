@@ -2,7 +2,8 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  Browsers
+  Browsers,
+  makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
@@ -13,7 +14,7 @@ import path from 'path';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = (process.env.API_KEY || 'multZap2026!secret').trim();
@@ -37,6 +38,7 @@ const msgRetryCounterMap = new Map();
 
 let cachedUnits = [];
 const recentEvents = [];
+let lastBackupResult = 'none';
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -46,7 +48,7 @@ const msgRetryCounterCache = {
   get: (key) => msgRetryCounterMap.get(key),
   set: (key, value) => {
     msgRetryCounterMap.set(key, value);
-    if (msgRetryCounterMap.size > 800) {
+    if (msgRetryCounterMap.size > 1000) {
       const firstKey = msgRetryCounterMap.keys().next().value;
       msgRetryCounterMap.delete(firstKey);
     }
@@ -55,7 +57,7 @@ const msgRetryCounterCache = {
   flushAll: () => msgRetryCounterMap.clear()
 };
 
-function setBoundedMap(map, key, value, maxSize = 1000) {
+function setBoundedMap(map, key, value, maxSize = 1500) {
   map.set(key, value);
   if (map.size > maxSize) {
     const firstKey = map.keys().next().value;
@@ -63,7 +65,7 @@ function setBoundedMap(map, key, value, maxSize = 1000) {
   }
 }
 
-function addBoundedSet(set, value, maxSize = 1000) {
+function addBoundedSet(set, value, maxSize = 1500) {
   set.add(value);
   if (set.size > maxSize) {
     const firstVal = set.values().next().value;
@@ -73,7 +75,7 @@ function addBoundedSet(set, value, maxSize = 1000) {
 
 function logEvent(info) {
   recentEvents.unshift({ time: new Date().toISOString(), ...info });
-  if (recentEvents.length > 30) recentEvents.pop();
+  if (recentEvents.length > 35) recentEvents.pop();
 }
 
 function getPhoneVariants(rawPhone) {
@@ -152,8 +154,7 @@ function extractMessageText(messageObj) {
   );
 }
 
-// Preserva creds.json, pre-key-* e app-state-sync-key-* (necessários para descriptografar mensagens!)
-// Ignora apenas session-* e sender-key-* para manter RAM baixa e evitar Bad MAC
+// Backup corrigido com ?on_conflict=id para NUNCA falhar no Supabase e evitar queda a cada deploy!
 async function scheduleFolderBackupToSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return;
   if (backupTimers[unitId]) clearTimeout(backupTimers[unitId]);
@@ -164,9 +165,6 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
       const files = fs.readdirSync(authFolder);
       const snapshot = {};
       for (const file of files) {
-        if (file.startsWith('session-') || file.startsWith('sender-key-')) {
-          continue;
-        }
         const fullPath = path.join(authFolder, file);
         if (fs.statSync(fullPath).isFile()) {
           snapshot[file] = fs.readFileSync(fullPath, 'utf-8');
@@ -174,7 +172,7 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
       }
       if (!snapshot['creds.json']) return;
 
-      await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions`, {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions?on_conflict=id`, {
         method: 'POST',
         headers: {
           apikey: SUPABASE_KEY,
@@ -191,10 +189,15 @@ async function scheduleFolderBackupToSupabase(unitId, authFolder) {
           }
         ])
       });
+
+      lastBackupResult = res.ok
+        ? `ok (${Object.keys(snapshot).length} files at ${new Date().toISOString()})`
+        : `error_http_${res.status}`;
     } catch (err) {
-      console.error(`[${unitId}] Erro no backup leve:`, err.message);
+      lastBackupResult = `exception: ${err.message}`;
+      console.error(`[${unitId}] Erro no backup snapshot:`, err.message);
     }
-  }, 8000);
+  }, 5000);
 }
 
 async function restoreFolderFromSupabase(unitId, authFolder) {
@@ -211,11 +214,11 @@ async function restoreFolderFromSupabase(unitId, authFolder) {
 
     fs.mkdirSync(authFolder, { recursive: true });
     for (const [fileName, content] of Object.entries(snapshot)) {
-      if (fileName.startsWith('session-') || fileName.startsWith('sender-key-')) continue;
       if (typeof content === 'string') {
         fs.writeFileSync(path.join(authFolder, fileName), content, 'utf-8');
       }
     }
+    lastBackupResult = `restored (${Object.keys(snapshot).length} files)`;
     return true;
   } catch (err) {
     console.error(`[${unitId}] Erro ao restaurar snapshot:`, err.message);
@@ -323,7 +326,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   if (!messageObj && key?.fromMe) return;
 
   if (msgId && sentMessagesCache.has(msgId)) {
-    addBoundedSet(processedMsgIds, msgId, 800);
+    addBoundedSet(processedMsgIds, msgId, 1000);
     logEvent({ status: 'ignored_ai_outbound_echo_by_id', msgId });
     return;
   }
@@ -340,16 +343,12 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   const fromMe = Boolean(key.fromMe);
   const senderName = pushName || 'Lead WhatsApp';
 
-  // BLOQUEIO ANTI-INVASÃO ANTES DE QUALQUER RETRY OU FALLBACK:
-  // Se a equipe (ex: Camilla) já iniciou conversa com esse número fora do CRM, ignora imediatamente!
   if (!fromMe && isExternalHumanChat(phone, remoteJid)) {
-    if (msgId) addBoundedSet(processedMsgIds, msgId, 800);
+    if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
     logEvent({ status: 'blocked_reply_to_human_external_chat', phone, remoteJid });
     return;
   }
 
-  // Se o WhatsApp Comercial entregou pacote @lid aguardando retry de chave:
-  // Aguarda 4.5s pelo texto real; se a Meta segurar o texto, usa o senderPn para não perder o lead novo!
   if (!messageObj) {
     if (!fromMe) {
       logEvent({ status: 'decrypt_retry_waiting', remoteJid, phone, msgId });
@@ -357,7 +356,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
         const timer = setTimeout(async () => {
           pendingRetryTimers.delete(msgId);
           if (processedMsgIds.has(msgId) || isExternalHumanChat(phone, remoteJid)) return;
-          addBoundedSet(processedMsgIds, msgId, 800);
+          addBoundedSet(processedMsgIds, msgId, 1000);
           logEvent({ status: 'lid_safe_fallback_to_crm', phone, remoteJid });
           await forwardToCrmWebhook({
             unitId,
@@ -368,7 +367,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
             text: 'Olá! Gostaria de saber mais informações sobre os cursos.',
             fromMe: false
           });
-        }, 4500);
+        }, 5000);
         pendingRetryTimers.set(msgId, timer);
       }
     }
@@ -395,12 +394,12 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
 
   const textSignature = text.trim().slice(0, 50);
   if (fromMe && recentAiTexts.has(textSignature)) {
-    if (msgId) addBoundedSet(processedMsgIds, msgId, 800);
+    if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
     logEvent({ status: 'ignored_ai_outbound_echo_by_text', phone });
     return;
   }
 
-  if (msgId) addBoundedSet(processedMsgIds, msgId, 800);
+  if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
 
   await forwardToCrmWebhook({
     unitId,
@@ -441,27 +440,25 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
     const { version } = await fetchLatestBaileysVersion();
 
+    // CONFIGURAÇÃO EXATA QUE FUNCIONOU NA ENTREGA DE BOAS-VINDAS (SEM BLOQUEAR O BOOTSTRAP DE CHAVES LID!)
     const sock = makeWASocket({
       version,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger)
+      },
       printQRInTerminal: false,
       logger,
       browser: Browsers.ubuntu('Chrome'),
-      markOnlineOnConnect: true, // Obrigatório para receber os pacotes de retry do @lid
-      syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
-      fireInitQueries: true,
+      markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000,
-      keepAliveIntervalMs: 25000,
       msgRetryCounterCache,
       getMessage: async (key) => {
         const cachedText = sentMessagesCache.get(key.id);
         if (cachedText) {
           return { conversation: cachedText };
         }
-        return { conversation: 'Olá!' };
+        return undefined;
       }
     });
 
@@ -482,6 +479,16 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       for (const c of updates) {
         if (c.lid && c.id) registerLidMapping(c.lid, c.id);
       }
+    });
+
+    sock.ev.on('messaging-history.set', ({ contacts }) => {
+      if (Array.isArray(contacts)) {
+        for (const c of contacts) {
+          if (c.lid && c.id) registerLidMapping(c.lid, c.id);
+        }
+      }
+      // Salva as chaves recebidas durante o bootstrap inicial no Supabase
+      scheduleFolderBackupToSupabase(unitId, authFolder);
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -521,9 +528,10 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify' && m.type !== 'append') return;
       for (const msg of m.messages) {
+        // Ignora mensagens históricas com mais de 60 segundos para não processar conversas antigas no bootstrap
         const msgTimestamp = Number(msg.messageTimestamp || 0);
         const nowSec = Math.floor(Date.now() / 1000);
-        if (m.type === 'append' && msgTimestamp > 0 && (nowSec - msgTimestamp) > 90) {
+        if (msgTimestamp > 0 && (nowSec - msgTimestamp) > 60) {
           if (msg.key?.fromMe) {
             markAsExternalHumanChat(msg.key?.senderPn, msg.key?.remoteJid);
           }
@@ -556,7 +564,7 @@ async function restoreAllSessionsOnBoot() {
       startUnitWhatsApp(unit.id, unit.name);
       await sleep(1500);
     } else if (unit.whatsapp_status === 'connected') {
-      await updateUnitInSupabase(unit.id, 'disconnected', null);
+      await updateUnitInSupabase(unitId, 'disconnected', null);
     }
   }
 }
@@ -595,6 +603,10 @@ async function sendHumanizedMessage(unitId, targetJid, messageText) {
   if (sentMsg?.key?.id) {
     setBoundedMap(sentMessagesCache, sentMsg.key.id, messageText, 300);
   }
+
+  setTimeout(() => {
+    try { sock.sendPresenceUpdate('unavailable'); } catch {}
+  }, 5000);
 
   return sentMsg;
 }
@@ -642,7 +654,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.7 (Pre-Keys Preservadas + Anti-Invasão + Entrega @s.whatsapp.net):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v6.9 (Bootstrap Nativo Signal + Persistência Cloud Corrigida):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -724,12 +736,19 @@ app.post('/logout/:unitId', async (req, res) => {
 app.get('/status', (req, res) => {
   const summary = {};
   for (const [id, s] of Object.entries(sessions)) {
-    summary[id] = { name: s.name, status: s.status, phone: s.phone };
+    let fileCount = 0;
+    try {
+      if (s.authFolder && fs.existsSync(s.authFolder)) {
+        fileCount = fs.readdirSync(s.authFolder).length;
+      }
+    } catch {}
+    summary[id] = { name: s.name, status: s.status, phone: s.phone, auth_files_on_disk: fileCount };
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v6.7_prekeys_safe_fallback',
+    engine: 'native_multifile_v6.9_bootstrap_fixed',
     memory_rss_mb: `${memMb} MB`,
+    last_cloud_backup: lastBackupResult,
     active_sessions: Object.keys(sessions).length,
     webhook_url_configured: WEBHOOK_URL,
     units: summary,
@@ -769,7 +788,6 @@ app.post('/send', async (req, res) => {
       if (!sock) return;
 
       const candidates = getPhoneVariants(cleanPhone);
-
       let targetJid = `${cleanPhone}@s.whatsapp.net`;
 
       for (const num of candidates) {
@@ -787,7 +805,6 @@ app.post('/send', async (req, res) => {
         status: 'outbound_sent_ok',
         unitId: targetUnitId,
         targetJid,
-        usedLid: false,
         msgId: sent?.key?.id || null
       });
       return sent;
@@ -805,7 +822,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v6.7 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v6.9 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
