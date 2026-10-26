@@ -3,7 +3,8 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
-  makeCacheableSignalKeyStore
+  makeCacheableSignalKeyStore,
+  downloadMediaMessage
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
@@ -14,7 +15,7 @@ import path from 'path';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = (process.env.API_KEY || 'multZap2026!secret').trim();
@@ -27,6 +28,7 @@ const SUPABASE_KEY = (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_R
 const sessions = {};
 const sendQueues = {};
 const backupTimers = {};
+const lastBackupTimestamp = {};
 const pendingRetryTimers = new Map();
 
 // Guarda o objeto Protobuf REAL (msg.message) para responder aos Retry Receipts sem erro de hash
@@ -178,61 +180,116 @@ function extractMessageText(messageObj) {
   );
 }
 
-// Debounce de 10s para aguardar o fim da rajada do syncFullHistory antes de enviar o snapshot ao Supabase
-async function scheduleFolderBackupToSupabase(unitId, authFolder) {
+function extractAudioObject(messageObj) {
+  if (!messageObj) return null;
+  const m =
+    messageObj.ephemeralMessage?.message ||
+    messageObj.viewOnceMessage?.message ||
+    messageObj.viewOnceMessageV2?.message ||
+    messageObj;
+  return m.audioMessage || null;
+}
+
+// BACKUP ULTRA-ECONÔMICO DE BANDA (Reduz o tráfego de 5 GB para menos de 10 MB/mês!)
+// Mantém todos os 35.404 arquivos intactos no disco local do Render, mas envia ao Supabase APENAS o creds.json + os 60 arquivos de chave mais recentes, com intervalo mínimo de 45 minutos!
+async function executeLeanBackupToSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return;
-  if (backupTimers[unitId]) clearTimeout(backupTimers[unitId]);
+  try {
+    if (!fs.existsSync(authFolder)) return;
+    const allFiles = fs.readdirSync(authFolder);
+    if (!allFiles.includes('creds.json')) return;
+
+    const snapshot = {};
+    const credsPath = path.join(authFolder, 'creds.json');
+    snapshot['creds.json'] = fs.readFileSync(credsPath, 'utf-8');
+
+    const recentKeyFiles = allFiles
+      .filter((f) => f !== 'creds.json' && (f.startsWith('session-') || f.startsWith('app-state-sync-key-')))
+      .map((f) => {
+        const fullPath = path.join(authFolder, f);
+        let mtime = 0;
+        try {
+          const st = fs.statSync(fullPath);
+          if (st.isFile()) mtime = st.mtimeMs;
+        } catch {}
+        return { name: f, fullPath, mtime };
+      })
+      .filter((item) => item.mtime > 0)
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, 60);
+
+    for (const item of recentKeyFiles) {
+      try {
+        snapshot[item.name] = fs.readFileSync(item.fullPath, 'utf-8');
+      } catch {}
+    }
+
+    const endpoint = SUPABASE_URL + '/rest/v1/whatsapp_sessions?on_conflict=id';
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates'
+      },
+      body: JSON.stringify([
+        {
+          id: `snapshot__${unitId}`,
+          unit_id: String(unitId),
+          data: snapshot,
+          updated_at: new Date().toISOString()
+        }
+      ])
+    });
+
+    lastBackupTimestamp[unitId] = Date.now();
+
+    if (!res.ok) {
+      const errTxt = await res.text();
+      lastBackupResult = `error_http_${res.status}: ${errTxt.slice(0, 80)}`;
+    } else {
+      lastBackupResult = `ok_lean (${Object.keys(snapshot).length} cloud / ${allFiles.length} local at ${new Date().toISOString()})`;
+    }
+  } catch (err) {
+    lastBackupResult = `exception: ${err.message}`;
+  }
+}
+
+function scheduleFolderBackupToSupabase(unitId, authFolder, forceImmediate = false) {
+  if (!SUPABASE_KEY || !unitId) return;
+
+  if (forceImmediate) {
+    if (backupTimers[unitId]) {
+      clearTimeout(backupTimers[unitId]);
+      delete backupTimers[unitId];
+    }
+    executeLeanBackupToSupabase(unitId, authFolder);
+    return;
+  }
+
+  // Se já existe um timer agendado para esta unidade, não cria outro (evita rajadas!)
+  if (backupTimers[unitId]) return;
+
+  const lastRun = lastBackupTimestamp[unitId] || 0;
+  const minIntervalMs = 45 * 60 * 1000; // 45 minutos entre backups na nuvem
+  const elapsed = Date.now() - lastRun;
+  const delayMs = elapsed > minIntervalMs ? 25000 : minIntervalMs;
 
   backupTimers[unitId] = setTimeout(async () => {
-    try {
-      if (!fs.existsSync(authFolder)) return;
-      const files = fs.readdirSync(authFolder);
-      const snapshot = {};
-      for (const file of files) {
-        const fullPath = path.join(authFolder, file);
-        if (fs.statSync(fullPath).isFile()) {
-          snapshot[file] = fs.readFileSync(fullPath, 'utf-8');
-        }
-      }
-      if (!snapshot['creds.json']) return;
-
-      const res = await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions?on_conflict=id`, {
-        method: 'POST',
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          'Content-Type': 'application/json',
-          Prefer: 'resolution=merge-duplicates'
-        },
-        body: JSON.stringify([
-          {
-            id: `snapshot__${unitId}`,
-            unit_id: String(unitId),
-            data: snapshot,
-            updated_at: new Date().toISOString()
-          }
-        ])
-      });
-
-      if (!res.ok) {
-        const errTxt = await res.text();
-        lastBackupResult = `error_http_${res.status}: ${errTxt.slice(0, 80)}`;
-      } else {
-        lastBackupResult = `ok (${Object.keys(snapshot).length} files at ${new Date().toISOString()})`;
-      }
-    } catch (err) {
-      lastBackupResult = `exception: ${err.message}`;
-    }
-  }, 10000);
+    delete backupTimers[unitId];
+    await executeLeanBackupToSupabase(unitId, authFolder);
+  }, delayMs);
 }
 
 async function restoreFolderFromSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return false;
   try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/whatsapp_sessions?id=eq.${encodeURIComponent(`snapshot__\${unitId}`)}&select=data`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
+    const snapId = `snapshot__${unitId}`;
+    const endpoint = `${SUPABASE_URL}/rest/v1/whatsapp_sessions?id=eq.${encodeURIComponent(snapId)}&select=data`;
+    const res = await fetch(endpoint, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
+    });
     if (!res.ok) return false;
     const rows = await res.json();
     const snapshot = rows?.[0]?.data;
@@ -294,7 +351,17 @@ async function updateUnitInSupabase(unitId, status, phone = null) {
   } catch {}
 }
 
-async function forwardToCrmWebhook({ unitId, unitName, phone, remoteJid, senderName, text, fromMe }) {
+async function forwardToCrmWebhook({
+  unitId,
+  unitName,
+  phone,
+  remoteJid,
+  senderName,
+  text,
+  audioBase64 = null,
+  audioMimeType = null,
+  fromMe
+}) {
   try {
     const whRes = await fetch(WEBHOOK_URL, {
       method: 'POST',
@@ -306,6 +373,8 @@ async function forwardToCrmWebhook({ unitId, unitName, phone, remoteJid, senderN
         remoteJid,
         senderName,
         message: text,
+        audioBase64,
+        audioMimeType,
         fromMe
       })
     });
@@ -316,11 +385,11 @@ async function forwardToCrmWebhook({ unitId, unitName, phone, remoteJid, senderN
     }
 
     logEvent({
-      status: 'delivered_to_crm',
+      status: audioBase64 ? 'audio_delivered_to_crm' : 'delivered_to_crm',
       unitName,
       phone,
       remoteJid,
-      text,
+      text: text || '[Áudio enviado p/ transcrição IA]',
       fromMe,
       httpStatus: whRes.status,
       crmResponse: whBody.slice(0, 180)
@@ -330,7 +399,11 @@ async function forwardToCrmWebhook({ unitId, unitName, phone, remoteJid, senderN
   }
 }
 
-async function processIncomingMessage(unitId, unitName, key, messageObj, pushName) {
+async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
+  const key = fullMsg?.key;
+  const messageObj = fullMsg?.message;
+  const pushName = fullMsg?.pushName;
+
   const remoteJid = key?.remoteJid || '';
   if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('status@broadcast') || remoteJid.includes('@newsletter')) {
     return;
@@ -420,8 +493,32 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   }
 
   const text = extractMessageText(messageObj);
+  const audioObj = extractAudioObject(messageObj);
+  let audioBase64 = null;
+  let audioMimeType = null;
 
-  if (!phone || !text) {
+  // Se o cliente enviou um ÁUDIO (ptt / voz de até 95 segundos), baixa em memória RAM, converte para Base64 e descarta o buffer!
+  if (!text && audioObj && !fromMe && phone) {
+    const durationSec = Number(audioObj.seconds || 0);
+    if (durationSec <= 95) {
+      try {
+        const buffer = await downloadMediaMessage(
+          fullMsg,
+          'buffer',
+          {},
+          { logger, reuploadRequest: sock?.updateMediaMessage }
+        );
+        if (buffer && buffer.length < 2.5 * 1024 * 1024) {
+          audioBase64 = buffer.toString('base64');
+          audioMimeType = audioObj.mimetype || 'audio/ogg';
+        }
+      } catch (audioErr) {
+        logEvent({ status: 'audio_download_error', phone, error: audioErr.message });
+      }
+    }
+  }
+
+  if (!phone || (!text && !audioBase64)) {
     if (!fromMe) {
       logEvent({ status: 'ignored_non_text_or_unmapped_lid', remoteJid, phone });
     }
@@ -431,7 +528,7 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
   if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
 
   if (!fromMe && isContactHumanActive(phone, remoteJid)) {
-    logEvent({ status: 'blocked_reply_to_human_external_chat', phone, remoteJid, text });
+    logEvent({ status: 'blocked_reply_to_human_external_chat', phone, remoteJid, text: text || '[Áudio]' });
     return;
   }
 
@@ -442,6 +539,8 @@ async function processIncomingMessage(unitId, unitName, key, messageObj, pushNam
     remoteJid,
     senderName,
     text,
+    audioBase64,
+    audioMimeType,
     fromMe
   });
 }
@@ -482,11 +581,9 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       },
       printQRInTerminal: false,
       logger,
-      // Desktop / syncFullHistory: true obriga o aparelho principal Business a transferir as chaves mestras de LID e app-state!
       browser: Browsers.ubuntu('Desktop'),
       markOnlineOnConnect: true,
       syncFullHistory: true,
-      // Filtra apenas pacotes essenciais de bootstrap/configuração/recentes (syncType 0, 1, 2, 3), barrando histórico antigo pesado para proteger a RAM
       shouldSyncHistoryMessage: (msg) => {
         const sType = msg?.syncType;
         if (sType === undefined || sType === null) return true;
@@ -533,7 +630,7 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
 
     sock.ev.on('creds.update', async () => {
       await saveCreds();
-      scheduleFolderBackupToSupabase(unitId, authFolder);
+      scheduleFolderBackupToSupabase(unitId, authFolder, false);
     });
 
     sock.ev.on('contacts.upsert', (contacts) => {
@@ -548,7 +645,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
       }
     });
 
-    // Extrai os mapeamentos LID e conversas humanas do Bootstrap sem reter mensagens antigas na memória RAM
     sock.ev.on('messaging-history.set', ({ contacts, messages }) => {
       let mappedCount = 0;
       if (Array.isArray(contacts)) {
@@ -571,7 +667,7 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         contactsMapped: mappedCount,
         historyMessagesInspected: Array.isArray(messages) ? messages.length : 0
       });
-      scheduleFolderBackupToSupabase(unitId, authFolder);
+      scheduleFolderBackupToSupabase(unitId, authFolder, false);
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -604,7 +700,8 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         const rawUserId = sock?.user?.id || '';
         session.phone = rawUserId ? rawUserId.split(':')[0].split('@')[0] : 'Ativo';
         await updateUnitInSupabase(unitId, 'connected', session.phone);
-        scheduleFolderBackupToSupabase(unitId, authFolder);
+        // Faz 1 backup enxuto na conexão inicial e depois agenda apenas a cada 45 minutos
+        scheduleFolderBackupToSupabase(unitId, authFolder, true);
       }
     });
 
@@ -627,14 +724,19 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
           }
           continue;
         }
-        await processIncomingMessage(unitId, unitName, msg.key, msg.message, msg.pushName);
+        await processIncomingMessage(unitId, unitName, msg, sock);
       }
     });
 
     sock.ev.on('messages.update', async (updates) => {
       for (const u of updates) {
         if (u.update?.message) {
-          await processIncomingMessage(unitId, unitName, u.key, u.update.message, u.update.pushName || 'Lead WhatsApp');
+          await processIncomingMessage(
+            unitId,
+            unitName,
+            { key: u.key, message: u.update.message, pushName: u.update.pushName || 'Lead WhatsApp' },
+            sock
+          );
         }
       }
     });
@@ -674,7 +776,6 @@ async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
 
   await sleep(randomBetween(700, 1200));
 
-  // Quando a conversa entrou via @lid (mappedLid presente), responde pelo mesmo canal ou pelo JID validado com chaves sincronizadas pelo Bootstrap
   const activeChatJid = mappedLid || targetJid;
 
   try {
@@ -744,7 +845,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v7.2 (SyncFullHistory + Bootstrap de Chaves Mestras LID):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v8.0 (Ultra-Baixo Consumo de Banda + Escuta de Áudio IA):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -840,7 +941,7 @@ app.get('/status', (req, res) => {
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v7.2_sync_full_bootstrap',
+    engine: 'native_multifile_v8.0_lean_backup_and_audio',
     memory_rss_mb: `${memMb} MB`,
     lid_mappings_in_memory: lidToPhoneMap.size,
     last_cloud_backup: lastBackupResult,
@@ -928,7 +1029,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v7.2 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v8.0 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
