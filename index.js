@@ -22,6 +22,7 @@ const API_KEY = (process.env.API_KEY || 'multZap2026!secret').trim();
 
 const cleanUrl = (url) => String(url || '').replace(/\[.*?\]\((.*?)\)/g, '$1').replace(/\/+$/, '').trim();
 const WEBHOOK_URL = cleanUrl(process.env.WEBHOOK_URL || 'https://multmanager.vercel.app/api/whatsapp-webhook');
+const FOLLOWUP_CRON_URL = WEBHOOK_URL.replace('/api/whatsapp-webhook', '/api/ai-followup');
 const SUPABASE_URL = cleanUrl(process.env.SUPABASE_URL || 'https://mpzupaofcmuaiiitgzud.supabase.co');
 const SUPABASE_KEY = (process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '').replace(/[\r\n\s]+/g, '');
 
@@ -31,7 +32,6 @@ const backupTimers = {};
 const lastBackupTimestamp = {};
 const pendingRetryTimers = new Map();
 
-// Guarda o objeto Protobuf REAL (msg.message) para responder aos Retry Receipts sem erro de hash
 const sentProtoMessagesCache = new Map();
 const recentAiTexts = new Set();
 const processedMsgIds = new Set();
@@ -43,6 +43,7 @@ const msgRetryCounterMap = new Map();
 let cachedUnits = [];
 const recentEvents = [];
 let lastBackupResult = 'none';
+let lastAutoFupTriggerResult = 'waiting_first_tick';
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -190,8 +191,43 @@ function extractAudioObject(messageObj) {
   return m.audioMessage || null;
 }
 
-// BACKUP ULTRA-ECONÔMICO DE BANDA (Reduz o tráfego de 5 GB para menos de 10 MB/mês!)
-// Mantém todos os 35.404 arquivos intactos no disco local do Render, mas envia ao Supabase APENAS o creds.json + os 60 arquivos de chave mais recentes, com intervalo mínimo de 45 minutos!
+// Extrai metadados de Anúncios Click-to-WhatsApp (Meta Ads: ctwa_clid, sourceId, título do criativo)
+function extractMetaAdTracking(messageObj) {
+  if (!messageObj) return null;
+  const m =
+    messageObj.ephemeralMessage?.message ||
+    messageObj.viewOnceMessage?.message ||
+    messageObj.viewOnceMessageV2?.message ||
+    messageObj;
+
+  const ctx =
+    m.extendedTextMessage?.contextInfo ||
+    m.imageMessage?.contextInfo ||
+    m.videoMessage?.contextInfo ||
+    m.audioMessage?.contextInfo ||
+    m.conversation?.contextInfo ||
+    null;
+
+  const ad = ctx?.externalAdReply;
+  if (!ad && !ctx?.conversionSource && !ctx?.entryPointConversionSource) return null;
+
+  const ctwaClid = ad?.ctwaClid || ctx?.ctwaClid || null;
+  const sourceId = ad?.sourceId || null;
+  const adTitle = ad?.title || ad?.body || null;
+  const adSourceUrl = ad?.sourceUrl || null;
+  const conversionSource = ctx?.conversionSource || ctx?.entryPointConversionSource || ad?.sourceType || null;
+
+  if (!ctwaClid && !sourceId && !adTitle && !adSourceUrl) return null;
+
+  return {
+    ctwaClid,
+    sourceId,
+    adTitle,
+    adSourceUrl,
+    conversionSource
+  };
+}
+
 async function executeLeanBackupToSupabase(unitId, authFolder) {
   if (!SUPABASE_KEY || !unitId) return;
   try {
@@ -268,11 +304,10 @@ function scheduleFolderBackupToSupabase(unitId, authFolder, forceImmediate = fal
     return;
   }
 
-  // Se já existe um timer agendado para esta unidade, não cria outro (evita rajadas!)
   if (backupTimers[unitId]) return;
 
   const lastRun = lastBackupTimestamp[unitId] || 0;
-  const minIntervalMs = 45 * 60 * 1000; // 45 minutos entre backups na nuvem
+  const minIntervalMs = 45 * 60 * 1000;
   const elapsed = Date.now() - lastRun;
   const delayMs = elapsed > minIntervalMs ? 25000 : minIntervalMs;
 
@@ -360,6 +395,8 @@ async function forwardToCrmWebhook({
   text,
   audioBase64 = null,
   audioMimeType = null,
+  adTracking = null,
+  humanActive = false,
   fromMe
 }) {
   try {
@@ -375,6 +412,8 @@ async function forwardToCrmWebhook({
         message: text,
         audioBase64,
         audioMimeType,
+        adTracking,
+        humanActive,
         fromMe
       })
     });
@@ -391,6 +430,7 @@ async function forwardToCrmWebhook({
       remoteJid,
       text: text || '[Áudio enviado p/ transcrição IA]',
       fromMe,
+      humanActive,
       httpStatus: whRes.status,
       crmResponse: whBody.slice(0, 180)
     });
@@ -449,7 +489,9 @@ async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
     markContactAsHumanActive(phone, remoteJid);
   }
 
-  if (!fromMe && isContactHumanActive(phone, remoteJid)) {
+  const humanCurrentlyActive = isContactHumanActive(phone, remoteJid);
+
+  if (!fromMe && humanCurrentlyActive) {
     cancelPendingFallbacksForContact(phone, remoteJid);
     if (!messageObj) {
       logEvent({ status: 'ignored_retry_on_human_chat', phone, remoteJid });
@@ -460,7 +502,7 @@ async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
   if (!messageObj) {
     if (!fromMe) {
       logEvent({ status: 'decrypt_retry_waiting', remoteJid, phone, msgId });
-      if (phone && msgId && !pendingRetryTimers.has(msgId) && !isContactHumanActive(phone, remoteJid)) {
+      if (phone && msgId && !pendingRetryTimers.has(msgId) && !humanCurrentlyActive) {
         const timer = setTimeout(async () => {
           pendingRetryTimers.delete(msgId);
           if (processedMsgIds.has(msgId) || isContactHumanActive(phone, remoteJid)) return;
@@ -494,10 +536,10 @@ async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
 
   const text = extractMessageText(messageObj);
   const audioObj = extractAudioObject(messageObj);
+  const adTracking = !fromMe ? extractMetaAdTracking(messageObj) : null;
   let audioBase64 = null;
   let audioMimeType = null;
 
-  // Se o cliente enviou um ÁUDIO (ptt / voz de até 95 segundos), baixa em memória RAM, converte para Base64 e descarta o buffer!
   if (!text && audioObj && !fromMe && phone) {
     const durationSec = Number(audioObj.seconds || 0);
     if (durationSec <= 95) {
@@ -527,11 +569,8 @@ async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
 
   if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
 
-  if (!fromMe && isContactHumanActive(phone, remoteJid)) {
-    logEvent({ status: 'blocked_reply_to_human_external_chat', phone, remoteJid, text: text || '[Áudio]' });
-    return;
-  }
-
+  // CORREÇÃO DEFINITIVA: Nunca mais descarta mensagens de conversas assumidas por humano!
+  // Envia sempre ao CRM com a flag humanActive para gravar 100% do histórico (incluindo áudios transcritos)!
   await forwardToCrmWebhook({
     unitId,
     unitName,
@@ -541,6 +580,8 @@ async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
     text,
     audioBase64,
     audioMimeType,
+    adTracking,
+    humanActive: humanCurrentlyActive,
     fromMe
   });
 }
@@ -700,7 +741,6 @@ async function startUnitWhatsApp(unitId, unitName = 'Unidade MULT') {
         const rawUserId = sock?.user?.id || '';
         session.phone = rawUserId ? rawUserId.split(':')[0].split('@')[0] : 'Ativo';
         await updateUnitInSupabase(unitId, 'connected', session.phone);
-        // Faz 1 backup enxuto na conexão inicial e depois agenda apenas a cada 45 minutos
         scheduleFolderBackupToSupabase(unitId, authFolder, true);
       }
     });
@@ -760,6 +800,39 @@ async function restoreAllSessionsOnBoot() {
     }
   }
 }
+
+// RELÓGIO DESPERTADOR INTERNO NATIVO (A cada 10 minutos aciona a régua automática de FUP na Vercel: 30m, 2h, 24h, 48h, 72h e 15d)
+// Gasta menos de 2 MB no mês inteiro mesmo com 6 unidades conectadas!
+async function triggerAutomatedFollowupCron() {
+  try {
+    const hasConnectedUnit = Object.values(sessions).some((s) => s?.status === 'connected');
+    if (!hasConnectedUnit) return;
+
+    const nowBr = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+    const day = nowBr.getDay();
+    const hour = nowBr.getHours();
+
+    // Só aciona em horário comercial (Seg-Sex 08h-20h, Sáb 08h-13h) para zero chamadas desnecessárias de madrugada
+    if (day === 0 || hour < 8 || hour >= 20 || (day === 6 && hour >= 13)) {
+      return;
+    }
+
+    const res = await fetch(FOLLOWUP_CRON_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'cron_all_units',
+        limit: 8
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    lastAutoFupTriggerResult = `ok_sent_${data.sentCount || 0}_at_${new Date().toISOString()}`;
+  } catch (err) {
+    lastAutoFupTriggerResult = `error: ${err.message}`;
+  }
+}
+
+setInterval(triggerAutomatedFollowupCron, 10 * 60 * 1000);
 
 async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
   const session = sessions[unitId];
@@ -845,7 +918,7 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v8.0 (Ultra-Baixo Consumo de Banda + Escuta de Áudio IA):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v9.0 (Full History Log + Meta Ads Tracker + Auto-FUP Cron):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
@@ -941,10 +1014,11 @@ app.get('/status', (req, res) => {
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v8.0_lean_backup_and_audio',
+    engine: 'native_multifile_v9.0_full_history_and_auto_cron',
     memory_rss_mb: `${memMb} MB`,
     lid_mappings_in_memory: lidToPhoneMap.size,
     last_cloud_backup: lastBackupResult,
+    last_auto_fup_cron: lastAutoFupTriggerResult,
     active_sessions: Object.keys(sessions).length,
     webhook_url_configured: WEBHOOK_URL,
     units: summary,
@@ -1029,7 +1103,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v8.0 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v9.0 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
