@@ -32,7 +32,7 @@ const WEBHOOK_SHARED_SECRET = String(process.env.WEBHOOK_SHARED_SECRET || '').tr
 const ADMIN_KEY = String(process.env.ADMIN_KEY || '').trim(); // protege painel/QR/logout/status (opcional)
 const FUP_CRON_INTERVAL_MIN = Math.max(2, Number(process.env.FUP_CRON_INTERVAL_MIN) || 10);
 const FUP_CRON_LIMIT = Math.min(20, Math.max(1, Number(process.env.FUP_CRON_LIMIT) || 3));
-const BACKUP_INTERVAL_MIN = Math.max(5, Number(process.env.BACKUP_INTERVAL_MIN) || 15);
+const BACKUP_INTERVAL_MIN = Math.max(5, Number(process.env.BACKUP_INTERVAL_MIN) || 60);
 const MAX_SEND_QUEUE_PER_UNIT = Math.max(20, Number(process.env.MAX_SEND_QUEUE_PER_UNIT) || 300);
 const BOOT_CLOUD_RESTORE_DELAY_MS =
   process.env.BOOT_CLOUD_RESTORE_DELAY_MS !== undefined && process.env.BOOT_CLOUD_RESTORE_DELAY_MS !== ''
@@ -66,6 +66,11 @@ let shuttingDown = false;
 let activeSends = 0;
 let fupCronInFlight = false;
 const backupInFlight = {};
+// v10.1: economia de banda do Render (plano free): só envia backup quando o conteúdo mudou
+const lastBackupHash = {};
+const lastBackupOkAt = {};
+const BACKUP_FORCE_REFRESH_MS = 6 * 60 * 60 * 1000; // mesmo sem mudança, reenvia a cada 6 h (garante que a nuvem tem uma cópia)
+const netStats = { backupBytes: 0, backupCount: 0, backupSkippedUnchanged: 0, webhookBytes: 0, webhookCount: 0 };
 const pendingSendCount = {};
 const sendResults = new Map();
 
@@ -354,13 +359,37 @@ async function executeLeanBackupToSupabase(unitId, authFolder, opts = {}) {
       60
     );
     // v10: mapa LID→telefone do Baileys (arquivos minúsculos) sobrevive ao deploy
-    const lidFiles = newestFiles((f) => f.startsWith('lid-mapping-'), 400);
+    const lidFiles = newestFiles((f) => f.startsWith('lid-mapping-'), 200);
 
     for (const item of [...recentKeyFiles, ...lidFiles]) {
       try {
         snapshot[item.name] = fs.readFileSync(item.fullPath, 'utf-8');
       } catch {}
     }
+
+    // v10.1: conteúdo idêntico ao último backup bem-sucedido => não gasta banda
+    const snapHash = crypto
+      .createHash('sha1')
+      .update(Object.keys(snapshot).sort().map((k) => k + '\u0000' + snapshot[k]).join('\u0001'))
+      .digest('hex');
+    if (
+      !opts.force &&
+      lastBackupHash[unitId] === snapHash &&
+      Date.now() - (lastBackupOkAt[unitId] || 0) < BACKUP_FORCE_REFRESH_MS
+    ) {
+      netStats.backupSkippedUnchanged++;
+      lastBackupResult = `skipped_unchanged at ${new Date().toISOString()}`;
+      return;
+    }
+
+    const backupBody = JSON.stringify([
+      {
+        id: `snapshot__${unitId}`,
+        unit_id: String(unitId),
+        data: snapshot,
+        updated_at: new Date().toISOString()
+      }
+    ]);
 
     const endpoint = SUPABASE_URL + '/rest/v1/whatsapp_sessions?on_conflict=id';
     const res = await fetch(endpoint, {
@@ -371,14 +400,7 @@ async function executeLeanBackupToSupabase(unitId, authFolder, opts = {}) {
         'Content-Type': 'application/json',
         Prefer: 'resolution=merge-duplicates'
       },
-      body: JSON.stringify([
-        {
-          id: `snapshot__${unitId}`,
-          unit_id: String(unitId),
-          data: snapshot,
-          updated_at: new Date().toISOString()
-        }
-      ]),
+      body: backupBody,
       signal: AbortSignal.timeout(opts.timeoutMs || 25000)
     });
 
@@ -388,7 +410,11 @@ async function executeLeanBackupToSupabase(unitId, authFolder, opts = {}) {
       const errTxt = await res.text();
       lastBackupResult = `error_http_${res.status}: ${errTxt.slice(0, 80)}`;
     } else {
-      lastBackupResult = `ok_lean (${Object.keys(snapshot).length} cloud / ${allFiles.length} local at ${new Date().toISOString()})`;
+      lastBackupHash[unitId] = snapHash;
+      lastBackupOkAt[unitId] = Date.now();
+      netStats.backupBytes += backupBody.length;
+      netStats.backupCount++;
+      lastBackupResult = `ok_lean (${Object.keys(snapshot).length} cloud / ${allFiles.length} local, ${Math.round(backupBody.length / 1024)} KB at ${new Date().toISOString()})`;
     }
   } catch (err) {
     lastBackupResult = `exception: ${err.message}`;
@@ -450,6 +476,8 @@ async function restoreFolderFromSupabase(unitId, authFolder) {
 }
 
 async function deleteSnapshotFromSupabase(unitId) {
+  delete lastBackupHash[unitId];
+  delete lastBackupOkAt[unitId];
   if (!SUPABASE_KEY || !unitId) return;
   try {
     await fetch(
@@ -502,6 +530,8 @@ async function postToCrmWebhook(payload) {
     try {
       const res = await fetch(WEBHOOK_URL, { method: 'POST', headers, body, signal: AbortSignal.timeout(58000) });
       const text = await res.text();
+      netStats.webhookBytes += body.length;
+      netStats.webhookCount++;
       // 429/502/503 = a Vercel nem chegou a processar: seguro repetir uma vez
       if ((res.status === 429 || res.status === 502 || res.status === 503) && attempt < 2) {
         await sleep(2500);
@@ -1310,6 +1340,17 @@ app.get('/status', (req, res) => {
     last_webhook_events: recentEvents,
     uptime_s: Math.round(process.uptime()),
     shutting_down: shuttingDown,
+    net_stats: (() => {
+      const upH = Math.max(process.uptime() / 3600, 0.05);
+      return {
+        ...netStats,
+        backup_interval_min: BACKUP_INTERVAL_MIN,
+        backup_avg_kb: netStats.backupCount ? Math.round(netStats.backupBytes / netStats.backupCount / 102.4) / 10 : null,
+        backup_projected_mb_month: Math.round((netStats.backupBytes / upH) * 24 * 30 / 1e6),
+        webhook_projected_mb_month: Math.round((netStats.webhookBytes / upH) * 24 * 30 / 1e6),
+        since_hours: Math.round(upH * 10) / 10
+      };
+    })(),
     send_queue_pending: pendingSendCount,
     security: {
       admin_key_enabled: Boolean(ADMIN_KEY),
