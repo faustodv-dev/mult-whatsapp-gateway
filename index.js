@@ -191,7 +191,6 @@ function extractAudioObject(messageObj) {
   return m.audioMessage || null;
 }
 
-// Extrai metadados de Anúncios Click-to-WhatsApp (Meta Ads: ctwa_clid, sourceId, título do criativo)
 function extractMetaAdTracking(messageObj) {
   if (!messageObj) return null;
   const m =
@@ -569,8 +568,6 @@ async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
 
   if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
 
-  // CORREÇÃO DEFINITIVA: Nunca mais descarta mensagens de conversas assumidas por humano!
-  // Envia sempre ao CRM com a flag humanActive para gravar 100% do histórico (incluindo áudios transcritos)!
   await forwardToCrmWebhook({
     unitId,
     unitName,
@@ -801,8 +798,7 @@ async function restoreAllSessionsOnBoot() {
   }
 }
 
-// RELÓGIO DESPERTADOR INTERNO NATIVO (A cada 10 minutos aciona a régua automática de FUP na Vercel: 30m, 2h, 24h, 48h, 72h e 15d)
-// Gasta menos de 2 MB no mês inteiro mesmo com 6 unidades conectadas!
+// RELÓGIO DESPERTADOR INTERNO NATIVO (A cada 10 minutos aciona a régua automática de FUP na Vercel para as unidades conectadas)
 async function triggerAutomatedFollowupCron() {
   try {
     const hasConnectedUnit = Object.values(sessions).some((s) => s?.status === 'connected');
@@ -812,8 +808,7 @@ async function triggerAutomatedFollowupCron() {
     const day = nowBr.getDay();
     const hour = nowBr.getHours();
 
-    // Só aciona em horário comercial (Seg-Sex 08h-20h, Sáb 08h-13h) para zero chamadas desnecessárias de madrugada
-    if (day === 0 || hour < 8 || hour >= 20 || (day === 6 && hour >= 13)) {
+    if (day === 0 || hour < 8 || hour >= 20 || (day === 6 && hour >= 14)) {
       return;
     }
 
@@ -822,7 +817,7 @@ async function triggerAutomatedFollowupCron() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         mode: 'cron_all_units',
-        limit: 8
+        limit: 3
       })
     });
     const data = await res.json().catch(() => ({}));
@@ -918,12 +913,26 @@ app.get('/', async (req, res) => {
   res.send(`
     <div style="font-family:sans-serif;text-align:center;padding:50px;background:#0f172a;color:#fff;min-height:100vh;">
       <h1 style="color:#f97316;">🛡️ Central WhatsApp Multi-Unidades - MULT Profissões</h1>
-      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v9.0 (Full History Log + Meta Ads Tracker + Auto-FUP Cron):</p>
+      <p style="color:#94a3b8;margin-bottom:35px;">Motor Oficial v9.1 (Strict Unit Session Isolation + Full History + Auto-FUP Cron):</p>
       <div style="display:flex;gap:24px;justify-content:center;flex-wrap:wrap;max-width:1000px;margin:0 auto;">
         ${cardsHtml || '<p>Nenhuma unidade encontrada.</p>'}
       </div>
     </div>
   `);
+});
+
+// Rota amigável caso o gestor acesse /connect/:unitId/status no navegador
+app.get('/connect/:unitId/status', (req, res) => {
+  const unitId = req.params.unitId;
+  const s = sessions[unitId] || { name: 'Unidade', status: 'disconnected', phone: null };
+  res.json({
+    unitId,
+    name: s.name,
+    status: s.status,
+    phone: s.phone,
+    last_cloud_backup: lastBackupResult,
+    last_auto_fup_cron: lastAutoFupTriggerResult
+  });
 });
 
 app.get('/connect/:unitId', async (req, res) => {
@@ -1014,7 +1023,7 @@ app.get('/status', (req, res) => {
   }
   const memMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   res.json({
-    engine: 'native_multifile_v9.0_full_history_and_auto_cron',
+    engine: 'native_multifile_v9.1_strict_unit_isolation',
     memory_rss_mb: `${memMb} MB`,
     lid_mappings_in_memory: lidToPhoneMap.size,
     last_cloud_backup: lastBackupResult,
@@ -1032,14 +1041,31 @@ app.post('/send', async (req, res) => {
 
   try {
     const { phone, remoteJid, message, unitId } = req.body;
+    const requestedUnitId = unitId ? String(unitId).trim() : null;
 
-    let targetUnitId = unitId && sessions[unitId]?.status === 'connected' ? unitId : null;
-    if (!targetUnitId) {
-      targetUnitId = Object.keys(sessions).find((k) => sessions[k]?.status === 'connected');
+    // ISOLAMENTO ESTRITO DE SESSÃO POR UNIDADE:
+    // Exige que unitId seja informado e que a própria unidade esteja 'connected'.
+    // NUNCA mais empresta o chip conectado de outra unidade!
+    if (!requestedUnitId || requestedUnitId === 'master') {
+      return res.status(400).json({
+        status: 'error',
+        error: 'Envio recusado: unitId da unidade é obrigatório.'
+      });
     }
 
-    if (!targetUnitId || !sessions[targetUnitId]?.sock) {
-      return res.status(400).json({ error: 'O WhatsApp desta unidade não está conectado no momento.', unitId });
+    const unitSession = sessions[requestedUnitId];
+    if (!unitSession || unitSession.status !== 'connected' || !unitSession.sock) {
+      logEvent({
+        status: 'blocked_send_unit_disconnected',
+        unitId: requestedUnitId,
+        unitName: unitSession?.name || requestedUnitId,
+        phone
+      });
+      return res.status(400).json({
+        status: 'error',
+        error: `O WhatsApp da unidade (${unitSession?.name || requestedUnitId}) não está conectado no momento.`,
+        unitId: requestedUnitId
+      });
     }
 
     let cleanPhone = String(phone || '').replace(/\D/g, '');
@@ -1053,9 +1079,9 @@ app.post('/send', async (req, res) => {
       setTimeout(() => recentAiTexts.delete(textKey), 120000);
     }
 
-    enqueueUnitSend(targetUnitId, async () => {
-      const sock = sessions[targetUnitId]?.sock;
-      if (!sock) return;
+    enqueueUnitSend(requestedUnitId, async () => {
+      const sock = sessions[requestedUnitId]?.sock;
+      if (!sock || sessions[requestedUnitId]?.status !== 'connected') return;
 
       const candidates = getPhoneVariants(cleanPhone);
 
@@ -1080,10 +1106,11 @@ app.post('/send', async (req, res) => {
         } catch {}
       }
 
-      const sent = await sendHumanizedMessage(targetUnitId, targetJid, mappedLid, message);
+      const sent = await sendHumanizedMessage(requestedUnitId, targetJid, mappedLid, message);
       logEvent({
         status: 'outbound_sent_ok',
-        unitId: targetUnitId,
+        unitId: requestedUnitId,
+        unitName: sessions[requestedUnitId]?.name,
         targetJid,
         mappedLid: mappedLid || null,
         msgId: sent?.key?.id || null
@@ -1093,8 +1120,8 @@ app.post('/send', async (req, res) => {
 
     return res.status(200).json({
       status: 'queued_humanized',
-      unitIdUsed: targetUnitId,
-      unitName: sessions[targetUnitId].name,
+      unitIdUsed: requestedUnitId,
+      unitName: unitSession.name,
       phone: cleanPhone
     });
   } catch (err) {
@@ -1103,7 +1130,7 @@ app.post('/send', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor Multi-Unidades v9.0 MULT CRM rodando na porta ${PORT}`);
+  console.log(`Servidor Multi-Unidades v9.1 MULT CRM rodando na porta ${PORT}`);
   restoreAllSessionsOnBoot();
 });
 
