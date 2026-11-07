@@ -1176,13 +1176,20 @@ if (FILA_ENABLED) setInterval(drainFila, FILA_INTERVAL_MS);
 // Flush das ocorrências: o Vercel grava no sistema MULT (via ponte) uma ocorrência
 // informativa por mensagem enviada, com a HORA REAL (enviado_em). O gateway só cutuca
 // o endpoint periodicamente — a escrita e os segredos da ponte ficam no Vercel.
-const OCORRENCIAS_URL = WEBHOOK_URL.replace('/api/whatsapp-webhook', '/api/ocorrencias');
+// Cutuca o próprio WEBHOOK_URL (que o gateway já alcança) com o header de flush,
+// em vez de uma rota nova — o Vercel Hobby limita a 12 funções.
 async function pingOcorrencias() {
   if (!FILA_ENABLED || shuttingDown || !WEBHOOK_SHARED_SECRET) return;
   try {
-    await fetch(OCORRENCIAS_URL, {
+    await fetch(WEBHOOK_URL, {
       method: 'POST',
-      headers: { 'x-webhook-secret': WEBHOOK_SHARED_SECRET, Authorization: `Bearer ${WEBHOOK_SHARED_SECRET}` },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-webhook-secret': WEBHOOK_SHARED_SECRET,
+        Authorization: `Bearer ${WEBHOOK_SHARED_SECRET}`,
+        'x-ocorrencias-flush': '1'
+      },
+      body: '{}',
       signal: AbortSignal.timeout(30000)
     });
   } catch {}
