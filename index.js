@@ -1104,6 +1104,91 @@ async function triggerAutomatedFollowupCron() {
 
 setInterval(triggerAutomatedFollowupCron, FUP_CRON_INTERVAL_MIN * 60 * 1000);
 
+// ---- Drenador da fila de mensagens (réguas/avisos) ----
+// O Vercel só ENFILEIRA (fila_mensagens) com agendado_para = horário da unidade.
+// Aqui o gateway (always-on) drena respeitando o horário e o ritmo humanizado,
+// grava enviado_em REAL, e reusa a fila serializada por unidade (enqueueUnitSend).
+const FILA_ENABLED = String(process.env.FILA_ENABLED ?? '1') !== '0';
+const FILA_INTERVAL_MS = Number(process.env.FILA_INTERVAL_MS || 6000);
+const FILA_BUFFER = Number(process.env.FILA_BUFFER || 3); // mensagens "em voo" por unidade
+let filaDraining = false;
+const filaHeaders = () => ({ apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` });
+
+async function patchFila(id, patch) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/fila_mensagens?id=eq.${id}`, {
+      method: 'PATCH',
+      headers: { ...filaHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch {}
+}
+
+async function drainFila() {
+  if (filaDraining || shuttingDown || !SUPABASE_KEY) return;
+  filaDraining = true;
+  try {
+    const nowIso = new Date().toISOString();
+    for (const unitId of Object.keys(sessions)) {
+      const session = sessions[unitId];
+      if (!session || session.status !== 'connected' || !session.sock) continue;
+      const faltam = FILA_BUFFER - (pendingSendCount[unitId] || 0);
+      if (faltam <= 0) continue;
+      const url = `${SUPABASE_URL}/rest/v1/fila_mensagens?unit_id=eq.${encodeURIComponent(unitId)}`
+        + `&status=eq.pendente&agendado_para=lte.${encodeURIComponent(nowIso)}`
+        + `&order=prioridade.asc,enfileirado_em.asc&limit=${faltam}`;
+      let rows = [];
+      try { rows = await fetch(url, { headers: filaHeaders(), signal: AbortSignal.timeout(15000) }).then((r) => r.json()); } catch { rows = []; }
+      if (!Array.isArray(rows) || !rows.length) continue;
+      for (const msg of rows) {
+        let claimed = [];
+        try {
+          claimed = await fetch(`${SUPABASE_URL}/rest/v1/fila_mensagens?id=eq.${msg.id}&status=eq.pendente`, {
+            method: 'PATCH',
+            headers: { ...filaHeaders(), 'Content-Type': 'application/json', Prefer: 'return=representation' },
+            body: JSON.stringify({ status: 'enviando', tentativas: (msg.tentativas || 0) + 1 }),
+            signal: AbortSignal.timeout(15000)
+          }).then((r) => r.json());
+        } catch { claimed = []; }
+        if (!Array.isArray(claimed) || !claimed.length) continue; // já foi pego por outro ciclo
+        const digits = String(msg.telefone || '').replace(/\D/g, '');
+        if (digits.length < 10) { await patchFila(msg.id, { status: 'erro', erro: 'telefone_invalido' }); continue; }
+        const targetJid = `${digits}@s.whatsapp.net`;
+        enqueueUnitSend(unitId, async () => {
+          try {
+            await sendHumanizedMessage(unitId, targetJid, null, String(msg.texto || ''));
+            await patchFila(msg.id, { status: 'enviado', enviado_em: new Date().toISOString(), erro: null });
+          } catch (e) {
+            const tent = (msg.tentativas || 0) + 1;
+            if (tent >= 3) await patchFila(msg.id, { status: 'erro', erro: String(e.message || e).slice(0, 300) });
+            else await patchFila(msg.id, { status: 'pendente', erro: String(e.message || e).slice(0, 300), agendado_para: new Date(Date.now() + 120000).toISOString() });
+          }
+        });
+      }
+    }
+  } finally {
+    filaDraining = false;
+  }
+}
+if (FILA_ENABLED) setInterval(drainFila, FILA_INTERVAL_MS);
+
+// Flush das ocorrências: o Vercel grava no sistema MULT (via ponte) uma ocorrência
+// informativa por mensagem enviada, com a HORA REAL (enviado_em). O gateway só cutuca
+// o endpoint periodicamente — a escrita e os segredos da ponte ficam no Vercel.
+const OCORRENCIAS_URL = WEBHOOK_URL.replace('/api/whatsapp-webhook', '/api/ocorrencias');
+async function pingOcorrencias() {
+  if (!FILA_ENABLED || shuttingDown || !WEBHOOK_SHARED_SECRET) return;
+  try {
+    await fetch(OCORRENCIAS_URL, {
+      method: 'POST',
+      headers: { 'x-webhook-secret': WEBHOOK_SHARED_SECRET, Authorization: `Bearer ${WEBHOOK_SHARED_SECRET}` },
+      signal: AbortSignal.timeout(30000)
+    });
+  } catch {}
+}
+if (FILA_ENABLED) setInterval(pingOcorrencias, 60000);
+
 async function sendHumanizedMessage(unitId, targetJid, mappedLid, messageText) {
   messageText = String(messageText ?? '');
   const session = sessions[unitId];
