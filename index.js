@@ -1112,6 +1112,7 @@ const FILA_ENABLED = String(process.env.FILA_ENABLED ?? '1') !== '0';
 const FILA_INTERVAL_MS = Number(process.env.FILA_INTERVAL_MS || 6000);
 const FILA_BUFFER = Number(process.env.FILA_BUFFER || 3); // mensagens "em voo" por unidade
 let filaDraining = false;
+let filaTick = 0;
 const filaHeaders = () => ({ apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` });
 
 async function patchFila(id, patch) {
@@ -1130,17 +1131,20 @@ async function drainFila() {
   filaDraining = true;
   try {
     const nowIso = new Date().toISOString();
+    const conectados = Object.keys(sessions).filter((u) => sessions[u]?.status === 'connected' && sessions[u]?.sock);
+    if ((++filaTick) % 10 === 1) console.log(`[fila] tick #${filaTick} sessions=[${Object.keys(sessions).join(',')}] conectados=[${conectados.join(',')}]`);
     for (const unitId of Object.keys(sessions)) {
       const session = sessions[unitId];
       if (!session || session.status !== 'connected' || !session.sock) continue;
       const faltam = FILA_BUFFER - (pendingSendCount[unitId] || 0);
-      if (faltam <= 0) continue;
+      if (faltam <= 0) { console.log(`[fila] ${unitId}: buffer cheio (pending=${pendingSendCount[unitId]})`); continue; }
       const url = `${SUPABASE_URL}/rest/v1/fila_mensagens?unit_id=eq.${encodeURIComponent(unitId)}`
         + `&status=eq.pendente&agendado_para=lte.${encodeURIComponent(nowIso)}`
         + `&order=prioridade.asc,enfileirado_em.asc&limit=${faltam}`;
       let rows = [];
       try { rows = await fetch(url, { headers: filaHeaders(), signal: AbortSignal.timeout(15000) }).then((r) => r.json()); } catch { rows = []; }
       if (!Array.isArray(rows) || !rows.length) continue;
+      console.log(`[fila] ${unitId}: ${rows.length} pendente(s) a enviar`);
       for (const msg of rows) {
         let claimed = [];
         try {
@@ -1168,7 +1172,9 @@ async function drainFila() {
             }
             await sendHumanizedMessage(unitId, targetJid, mappedLid, String(msg.texto || ''));
             await patchFila(msg.id, { status: 'enviado', enviado_em: new Date().toISOString(), erro: null });
+            console.log(`[fila] enviado ${msg.id} (${unitId} -> ${targetJid})`);
           } catch (e) {
+            console.log(`[fila] ERRO envio ${msg.id} (${unitId}): ${String(e.message || e).slice(0, 140)}`);
             const tent = (msg.tentativas || 0) + 1;
             if (tent >= 3) await patchFila(msg.id, { status: 'erro', erro: String(e.message || e).slice(0, 300) });
             else await patchFila(msg.id, { status: 'pendente', erro: String(e.message || e).slice(0, 300), agendado_para: new Date(Date.now() + 120000).toISOString() });
@@ -1180,7 +1186,12 @@ async function drainFila() {
     filaDraining = false;
   }
 }
-if (FILA_ENABLED) setInterval(drainFila, FILA_INTERVAL_MS);
+if (FILA_ENABLED) {
+  setInterval(drainFila, FILA_INTERVAL_MS);
+  console.log(`[fila] drenador LIGADO intervalo=${FILA_INTERVAL_MS}ms buffer=${FILA_BUFFER}`);
+} else {
+  console.log('[fila] drenador DESLIGADO (FILA_ENABLED=0)');
+}
 
 // Flush das ocorrências: o Vercel grava no sistema MULT (via ponte) uma ocorrência
 // informativa por mensagem enviada, com a HORA REAL (enviado_em). O gateway só cutuca
