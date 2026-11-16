@@ -1505,6 +1505,130 @@ app.post('/send', async (req, res) => {
   }
 });
 
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// v11: ENVIO DE DOCUMENTO (PDF) PELO CRM — endpoint novo e isolado; o /send de texto não foi alterado.
+// O arquivo chega em base64 (já limitado pelo CRM a 3 MB), é enviado e descartado: nada é gravado em disco.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+const MAX_DOC_BYTES = 3 * 1024 * 1024 + 64 * 1024;
+
+function safeDocName(name) {
+  const base = String(name || 'documento.pdf').split(/[\\/]/).pop().replace(/[\u0000-\u001f<>:"|?*]+/g, '').trim();
+  const withExt = /\.pdf$/i.test(base) ? base : `${base || 'documento'}.pdf`;
+  return withExt.slice(-120);
+}
+
+async function sendHumanizedDocument(unitId, targetJid, mappedLid, buffer, fileName, caption) {
+  const session = sessions[unitId];
+  if (!session || session.status !== 'connected' || !session.sock) {
+    throw new Error('Sessão da unidade desconectada.');
+  }
+  const sock = session.sock;
+  const activeChatJid = mappedLid || targetJid;
+  await sleep(randomBetween(700, 1200));
+  try {
+    await sock.presenceSubscribe(activeChatJid);
+    await sock.sendPresenceUpdate('composing', activeChatJid);
+  } catch {}
+  await sleep(randomBetween(1200, 2000));
+  try {
+    await sock.sendPresenceUpdate('paused', activeChatJid);
+  } catch {}
+  const content = { document: buffer, mimetype: 'application/pdf', fileName };
+  if (caption) content.caption = caption;
+  const sentMsg = await sock.sendMessage(targetJid, content);
+  if (sentMsg?.key?.id) addBoundedSet(processedMsgIds, sentMsg.key.id, 1000);
+  return sentMsg;
+}
+
+app.post('/send-media', async (req, res) => {
+  const token = req.headers['apikey'] || req.headers['authorization']?.replace('Bearer ', '');
+  if (!safeEqual(token, API_KEY)) return res.status(401).json({ error: 'Não autorizado' });
+  if (shuttingDown) {
+    return res.status(503).json({ status: 'error', error: 'Gateway reiniciando (deploy). Tente novamente em instantes.', retryable: true });
+  }
+
+  try {
+    const { phone, remoteJid, unitId, mediaType, fileName, caption, dataBase64 } = req.body || {};
+    const requestedUnitId = unitId ? String(unitId).trim() : null;
+    if (!requestedUnitId || requestedUnitId === 'master') {
+      return res.status(400).json({ status: 'error', error: 'Envio recusado: unitId da unidade é obrigatório.' });
+    }
+    if (mediaType !== 'document') {
+      return res.status(400).json({ status: 'error', error: 'Tipo de mídia não suportado (somente PDF por enquanto).' });
+    }
+    const unitSession = sessions[requestedUnitId];
+    if (!unitSession || unitSession.status !== 'connected' || !unitSession.sock) {
+      return res.status(400).json({ status: 'error', error: `O WhatsApp da unidade (${unitSession?.name || requestedUnitId}) não está conectado no momento.`, unitId: requestedUnitId });
+    }
+
+    let cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone.startsWith('55') && cleanPhone.length <= 11) cleanPhone = `55${cleanPhone}`;
+    if (cleanPhone.length < 10) return res.status(400).json({ status: 'error', error: 'Telefone inválido.' });
+
+    const b64 = String(dataBase64 || '').replace(/^data:.*?;base64,/i, '').replace(/[\r\n\s]+/g, '');
+    if (!b64) return res.status(400).json({ status: 'error', error: 'Arquivo vazio.' });
+    const buffer = Buffer.from(b64, 'base64');
+    if (!buffer.length) return res.status(400).json({ status: 'error', error: 'Arquivo vazio.' });
+    if (buffer.length > MAX_DOC_BYTES) return res.status(413).json({ status: 'error', error: 'Arquivo acima de 3 MB.' });
+    if (buffer.subarray(0, 5).toString('latin1') !== '%PDF-') {
+      return res.status(400).json({ status: 'error', error: 'O arquivo não é um PDF válido.' });
+    }
+    if ((pendingSendCount[requestedUnitId] || 0) >= MAX_SEND_QUEUE_PER_UNIT) {
+      return res.status(429).json({ status: 'error', error: 'Fila de envio da unidade cheia. Tente novamente em instantes.', retryable: true });
+    }
+
+    const safeName = safeDocName(fileName);
+    const cleanCaption = String(caption || '').trim().slice(0, 900);
+    const requestId = crypto.randomUUID();
+    const track = (rec) =>
+      setBoundedMap(sendResults, requestId, { requestId, unitId: requestedUnitId, phone: cleanPhone, kind: 'document', at: new Date().toISOString(), ...rec }, 500);
+    track({ status: 'queued' });
+    let settle;
+    const done = new Promise((resolve) => { settle = resolve; });
+    const finish = (rec) => { track(rec); settle(rec); };
+
+    enqueueUnitSend(requestedUnitId, async () => {
+      try {
+        const sock = sessions[requestedUnitId]?.sock;
+        if (!sock || sessions[requestedUnitId]?.status !== 'connected') {
+          finish({ status: 'failed', error: 'unit_disconnected_before_send' });
+          return;
+        }
+        const candidates = getPhoneVariants(cleanPhone);
+        let mappedLid = remoteJid && String(remoteJid).includes('@lid') ? String(remoteJid).trim() : null;
+        if (!mappedLid) {
+          for (const num of candidates) {
+            if (phoneToLidMap.has(num)) { mappedLid = phoneToLidMap.get(num); break; }
+          }
+        }
+        let targetJid = `${cleanPhone}@s.whatsapp.net`;
+        let jidVerified = false;
+        for (const num of candidates) {
+          try {
+            const [result] = await sock.onWhatsApp(num);
+            if (result && result.exists && result.jid) { targetJid = result.jid; jidVerified = true; break; }
+          } catch {}
+        }
+        const sent = await sendHumanizedDocument(requestedUnitId, targetJid, mappedLid, buffer, safeName, cleanCaption);
+        logEvent({ status: 'outbound_document_ok', unitId: requestedUnitId, unitName: sessions[requestedUnitId]?.name, targetJid, jidVerified, bytes: buffer.length, msgId: sent?.key?.id || null });
+        finish({ status: 'sent', msgId: sent?.key?.id || null, targetJid, jidVerified });
+        return sent;
+      } catch (err) {
+        finish({ status: 'failed', error: err.message });
+        throw err;
+      }
+    });
+
+    const base = { unitIdUsed: requestedUnitId, unitName: unitSession.name, phone: cleanPhone, requestId, fileName: safeName };
+    const rec = await Promise.race([done, sleep(45000).then(() => null)]);
+    if (rec?.status === 'sent') return res.status(200).json({ status: 'sent', ...base, msgId: rec.msgId, jidVerified: rec.jidVerified });
+    if (rec?.status === 'failed') return res.status(502).json({ status: 'error', ...base, error: rec.error });
+    return res.status(200).json({ status: 'queued_humanized', ...base, delivery: 'pending' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/send/status/:requestId', (req, res) => {
   const token = req.headers['apikey'] || req.headers['authorization']?.replace('Bearer ', '');
   if (!safeEqual(token, API_KEY)) return res.status(401).json({ error: 'Não autorizado' });
