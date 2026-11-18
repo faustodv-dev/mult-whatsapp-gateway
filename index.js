@@ -279,6 +279,65 @@ function extractAudioObject(messageObj) {
   return m.audioMessage || null;
 }
 
+// v12: mídia enviada pelo CELULAR do orientador (áudio, foto, PDF, vídeo...) vira uma linha curta no CRM.
+// Só metadados: nada é baixado nem guardado (sem custo de rede, disco ou Supabase além de ~100 bytes na nota).
+function fmtMediaDuration(sec) {
+  const n = Math.round(Number(sec) || 0);
+  if (!n) return '';
+  return ` ${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}`;
+}
+
+function describeOutboundMedia(messageObj) {
+  if (!messageObj) return { kind: '', label: '' };
+  const m =
+    messageObj.ephemeralMessage?.message ||
+    messageObj.viewOnceMessage?.message ||
+    messageObj.viewOnceMessageV2?.message ||
+    messageObj.documentWithCaptionMessage?.message ||
+    messageObj;
+  if (m.audioMessage) {
+    return { kind: 'audio', label: `${m.audioMessage.ptt ? '🎙️ áudio de voz' : '🎵 áudio'}${fmtMediaDuration(m.audioMessage.seconds)}` };
+  }
+  if (m.imageMessage) return { kind: 'image', label: '📷 imagem' };
+  if (m.videoMessage || m.ptvMessage) {
+    return { kind: 'video', label: `🎬 vídeo${fmtMediaDuration((m.videoMessage || m.ptvMessage).seconds)}` };
+  }
+  if (m.documentMessage) {
+    const name = String(m.documentMessage.fileName || '').replace(/[\u0000-\u001f"]+/g, '').trim().slice(0, 60);
+    const isPdf = /pdf/i.test(String(m.documentMessage.mimetype || '')) || /\.pdf$/i.test(name);
+    return { kind: 'document', label: `📄 ${isPdf ? 'PDF' : 'documento'}${name ? `: ${name}` : ''}` };
+  }
+  if (m.stickerMessage) return { kind: 'sticker', label: '🏷️ figurinha' };
+  if (m.contactMessage || m.contactsArrayMessage) return { kind: 'contact', label: '👤 contato' };
+  if (m.locationMessage || m.liveLocationMessage) return { kind: 'location', label: '📍 localização' };
+  return { kind: '', label: '' };
+}
+
+// Mídia que o PRÓPRIO gateway acabou de enviar (PDF pelo CRM): o eco que o WhatsApp devolve não deve virar nota duplicada.
+const gatewayMediaSends = new Map(); // chave (jid ou telefone) -> { kind, at }
+const GATEWAY_MEDIA_ECHO_MS = 120000;
+
+function markGatewayMediaSend(kind, ...jidsOrPhones) {
+  const at = Date.now();
+  for (const raw of jidsOrPhones) {
+    if (!raw) continue;
+    setBoundedMap(gatewayMediaSends, String(raw).trim(), { kind, at }, 500);
+    for (const v of getPhoneVariants(raw)) setBoundedMap(gatewayMediaSends, v, { kind, at }, 500);
+  }
+}
+
+function consumeGatewayMediaSend(kind, phone, remoteJid) {
+  const keys = [String(remoteJid || '').trim(), ...getPhoneVariants(phone)].filter(Boolean);
+  const now = Date.now();
+  let hit = false;
+  for (const k of keys) {
+    const rec = gatewayMediaSends.get(k);
+    if (rec && rec.kind === kind && now - rec.at <= GATEWAY_MEDIA_ECHO_MS) hit = true;
+  }
+  if (hit) for (const k of keys) gatewayMediaSends.delete(k);
+  return hit;
+}
+
 function extractMetaAdTracking(messageObj) {
   if (!messageObj) return null;
   const m =
@@ -698,7 +757,25 @@ async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
     return;
   }
 
-  const text = extractMessageText(messageObj);
+  let text = extractMessageText(messageObj);
+
+  if (fromMe) {
+    const media = describeOutboundMedia(messageObj);
+    if (media.kind) {
+      // eco de mídia enviada pelo próprio gateway (PDF do CRM): já tem nota própria, não duplica
+      if (consumeGatewayMediaSend(media.kind, phone, remoteJid)) {
+        if (msgId) addBoundedSet(processedMsgIds, msgId, 1000);
+        logEvent({ status: 'ignored_gateway_media_echo', msgId, phone, kind: media.kind });
+        return;
+      }
+      // mídia enviada pelo celular sem legenda: registra uma linha curta (com legenda, o texto da legenda já é usado)
+      if (!text) {
+        text = `[${media.label}]`;
+        logEvent({ status: 'outbound_media_from_phone', phone, kind: media.kind });
+      }
+    }
+  }
+
   const audioObj = extractAudioObject(messageObj);
   const adTracking = !fromMe ? extractMetaAdTracking(messageObj) : null;
   let audioBase64 = null;
@@ -727,6 +804,14 @@ async function processIncomingMessage(unitId, unitName, fullMsg, sock) {
   if (!phone || (!text && !audioBase64)) {
     if (!fromMe) {
       logEvent({ status: 'ignored_non_text_or_unmapped_lid', remoteJid, phone });
+    } else {
+      // medição: o que o celular enviou e NÃO chegou ao CRM (número oculto/LID sem tradução ou tipo de mensagem desconhecido)
+      logEvent({
+        status: phone ? 'ignored_outbound_unsupported_type' : 'ignored_outbound_unmapped_lid',
+        remoteJid,
+        phone,
+        types: Object.keys(messageObj || {}).slice(0, 4)
+      });
     }
     return;
   }
@@ -1535,6 +1620,8 @@ async function sendHumanizedDocument(unitId, targetJid, mappedLid, buffer, fileN
   } catch {}
   const content = { document: buffer, mimetype: 'application/pdf', fileName };
   if (caption) content.caption = caption;
+  // marca ANTES de enviar: o eco do WhatsApp pode chegar antes do sendMessage retornar
+  markGatewayMediaSend('document', targetJid, mappedLid);
   const sentMsg = await sock.sendMessage(targetJid, content);
   if (sentMsg?.key?.id) addBoundedSet(processedMsgIds, sentMsg.key.id, 1000);
   return sentMsg;
